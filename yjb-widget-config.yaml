@@ -1,0 +1,18 @@
+# Merge these entries into the active Egern config's `scriptings` and `widgets` arrays.
+# Keep the token and signing secret in the local Egern widget environment only.
+scriptings:
+  - generic:
+      name: 养基宝持仓
+      script_url: ./yjb-fund-widget.js
+      timeout: 20
+
+widgets:
+  - name: 养基宝持仓
+    script_name: 养基宝持仓
+    env:
+      YJB_API: new
+      YJB_API_BASE: https://app-api.yangjibao.com
+      YJB_POLICY: ''
+      YJB_TOKEN: <在本机填写养基宝登录令牌>
+      YJB_SIGNING_SECRET: <在本机填写养基宝接口签名密钥>
+      YJB_ACCOUNT_ID: ''
