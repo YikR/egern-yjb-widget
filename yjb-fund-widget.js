@@ -273,11 +273,14 @@ function mergeCachedRows(rows, cachedRows) {
   return rows.map((row) => {
     if (row.estimateIsLive) return row;
     const cached = cachedById.get(String(row.id)) || cachedByName.get(String(row.name));
-    if (!cached || cached.estimatePct === null || cached.estimatePct === undefined) return row;
+    if (!cached) return row;
+    const hasCachedValuation = [cached.estimatePct, cached.estimateAmount, cached.estimateNav, cached.lastNav]
+      .some((value) => value !== null && value !== undefined && value !== '');
+    if (!hasCachedValuation) return row;
     return {
       ...row,
       estimateAmount: cached.estimateAmount ?? row.estimateAmount,
-      estimatePct: cached.estimatePct,
+      estimatePct: cached.estimatePct ?? row.estimatePct,
       estimateIsLive: false,
       estimateNav: cached.estimateNav ?? row.estimateNav,
       lastNav: cached.lastNav ?? row.lastNav,
