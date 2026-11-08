@@ -12,7 +12,7 @@
 - 更新间隔：留空使用 Egern 默认的 86400 秒，或自行设置
 - 启用：打开
 
-保存后编辑该模块，在“环境变量”中填写 `YJB_TOKEN` 和 `YJB_SIGNING_SECRET`。不要把真实值发到聊天或提交到 GitHub。`YJB_ACCOUNT_ID` 和 `YJB_POLICY` 为可选项；账户 ID 留空时使用第一个基金账户，策略组留空时走 Egern 默认策略。模块文件声明的环境变量会由 Egern 自动生成输入项。
+保存后编辑该模块，在“环境变量”中填写 `YJB_TOKEN`。新接口所需的固定 `YJB_SIGNING_SECRET` 已放在模块内，不需要手动填写；`YJB_ACCOUNT_ID` 和 `YJB_POLICY` 为可选项。账户 ID 留空时使用第一个基金账户，策略组留空时走 Egern 默认策略。模块文件声明的环境变量会由 Egern 自动生成输入项。
 
 添加模块后，打开 Egern 的小组件图库，在“模块小组件”中找到“养基宝持仓”并添加到主屏幕或锁屏。模块里的脚本会通过同仓库的 GitHub Raw 地址加载：
 `https://raw.githubusercontent.com/YikR/egern-yjb-widget/main/yjb-fund-widget.js`
@@ -21,7 +21,7 @@
 
 默认使用 HTTPS App API `https://app-api.yangjibao.com`。脚本从 Egern 模块环境读取 Token 和签名密钥，按接口要求生成请求签名；仓库文件不包含账户凭据。脚本不会执行登录，也不会收集手机号或验证码。令牌失效后，在本机更新 Egern 模块 Env 中的 Token。
 
-`YJB_SIGNING_SECRET` 是接口签名材料，按养基宝 API 文档获取后只填入 Egern 本机模块 Env。不要将其写入模块 YAML、脚本、公开配置或聊天消息。若要让数据请求经指定策略组发出，可设置 `YJB_POLICY` 为现有策略组名称。
+模块内置的是新 App API 使用的固定签名常量；你的个人 `YJB_TOKEN` 仍只保存在 Egern 本机模块 Env。若接口未来更换签名常量，只需更新模块版本。若要让数据请求经指定策略组发出，可设置 `YJB_POLICY` 为现有策略组名称。
 
 ## 请求与认证
 

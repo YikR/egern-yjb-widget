@@ -8,9 +8,6 @@ env_schema:
   YJB_TOKEN:
     name: 养基宝登录令牌
     description: 只在 Egern 的本机模块 Env 中填写，不要提交到 GitHub 或发送到聊天。
-  YJB_SIGNING_SECRET:
-    name: API 签名密钥
-    description: 按养基宝 API 文档获取，并只保存在 Egern 的本机模块 Env 中。
   YJB_ACCOUNT_ID:
     name: 基金账户 ID（可选）
     description: 留空时读取账号返回的第一个基金账户。
@@ -28,3 +25,6 @@ scriptings:
 widgets:
   - name: 养基宝持仓
     script_name: 养基宝持仓
+    env:
+      # 养基宝新 App API 的固定签名常量；账号 Token 不写入远程模块。
+      YJB_SIGNING_SECRET: "Zk0w9mX7IKFGo5qp5jyDwJKnU7ZJZZJwGhs5myg4vlv4lKEHFKxGe6jlb84KOLkx"
