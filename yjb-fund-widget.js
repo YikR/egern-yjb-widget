@@ -5,14 +5,14 @@ const OPEN_REFRESH_SECONDS = 60;
 const CLOSED_REFRESH_SECONDS = 15 * 60;
 const ERROR_REFRESH_SECONDS = 5 * 60;
 
-function text(value, size, weight, color, maxLines = 1) {
+function text(value, size, weight, color, maxLines = 1, minScale = 0.7) {
   return {
     type: 'text',
     text: String(value),
     font: { size, weight },
     textColor: color,
     maxLines,
-    minScale: 0.7,
+    minScale,
   };
 }
 
@@ -20,6 +20,16 @@ function formatNumber(value, suffix = '') {
   const number = Number(value);
   if (!Number.isFinite(number)) return '--';
   return `${number > 0 ? '+' : ''}${number.toFixed(2)}${suffix}`;
+}
+
+function formatNav(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number.toFixed(4) : '--';
+}
+
+function formatRatio(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? `${number.toFixed(1)}%` : '--';
 }
 
 function pickNumber(...values) {
@@ -56,6 +66,9 @@ function readList(value) {
   if (Array.isArray(data)) return data;
   if (data && Array.isArray(data.list)) return data.list;
   if (data && Array.isArray(data.funds)) return data.funds;
+  if (data && Array.isArray(data.items)) return data.items;
+  if (data && Array.isArray(data.rows)) return data.rows;
+  if (data && Array.isArray(data.fund_list)) return data.fund_list;
   return [];
 }
 
@@ -143,21 +156,48 @@ function normalizeRows(holdings, fundInfo, quoteById = new Map()) {
     const quote = quoteById.get(String(id)) || {};
     const liveEstimatePct = pickNumber(
       quote.gszzl, quote.vgszzl, quote.zsgzzl, quote.increase_rate, quote.increaseRate,
-      quote.day_growth_rate,
+      quote.day_growth_rate, quote.change_percent, quote.changePercent,
     );
     const publishedPct = pickNumber(
-      info.gszzl, info.vgszzl, info.zsgzzl, info.day_growth_rate, info.increase_rate,
-      info.increaseRate, info.rate,
-      holding.day_growth_rate, holding.increase_rate, holding.gszzl,
+      info.gszzl, info.vgszzl, info.zsgzzl, info.day_growth_rate, info.dayGrowthRate,
+      info.increase_rate, info.increaseRate, info.rate, info.change_percent, info.changePercent,
+      info.growth_rate, info.growthRate, info.rise_rate, info.riseRate,
+      holding.day_growth_rate, holding.dayGrowthRate, holding.increase_rate, holding.increaseRate,
+      holding.gszzl, holding.vgszzl, holding.zsgzzl,
     );
-    const estimatePct = liveEstimatePct ?? publishedPct;
-    const estimateNav = pickNumber(quote.gsz, quote.vgsz, quote.zsgz, quote.estimate_nav, quote.estimated_nav);
-    const lastNav = pickNumber(holding.last_net, holding.last_nav, holding.lastNet, info.last_net, info.last_nav);
+    const estimateNav = pickNumber(
+      quote.gsz, quote.vgsz, quote.zsgz, quote.estimate_nav, quote.estimated_nav,
+      quote.estimateNav, quote.estimatedNav, quote.nav,
+      info.gsz, info.vgsz, info.zsgz, info.estimate_nav, info.estimated_nav,
+      info.estimateNav, info.estimatedNav,
+    );
+    const lastNav = pickNumber(
+      holding.last_net, holding.last_nav, holding.lastNet, holding.net_value, holding.unit_nav,
+      holding.nav, holding.netValue,
+      info.last_net, info.last_nav, info.lastNet, info.net_value, info.unit_nav,
+      info.nav, info.netValue, info.dwjz, info.unitNetValue, info.latest_nav,
+    );
+    const derivedPct = publishedPct === null && estimateNav !== null && lastNav !== null && lastNav !== 0
+      ? (estimateNav - lastNav) / lastNav * 100
+      : null;
+    const estimatePct = liveEstimatePct ?? publishedPct ?? derivedPct;
     const shares = pickNumber(holding.hold_share, holding.shares, holding.share, holding.amount_share);
-    const marketValue = pickNumber(holding.money, holding.market_value, holding.current_value, holding.total_value);
+    const providedRatio = pickNumber(
+      holding.position_ratio, holding.positionRatio, holding.holding_ratio, holding.holdingRatio,
+      holding.proportion, holding.percent, holding.percentage,
+    );
+    const marketValue = pickNumber(
+      holding.money, holding.market_value, holding.current_value, holding.total_value,
+      holding.marketValue, holding.assets, holding.asset_value,
+    ) ?? (shares !== null && (estimateNav ?? lastNav) !== null ? shares * (estimateNav ?? lastNav) : null);
     const directEstimateAmount = pickNumber(
       quote.estimate_amount, quote.estimated_amount, quote.gsz_change_amount, quote.vgsz_change_amount,
-      quote.estimate_profit, quote.estimated_profit, quote.profit, quote.income,
+      quote.estimate_profit, quote.estimated_profit, quote.estimateProfit, quote.estimatedProfit,
+      quote.increase_amount, quote.increaseAmount, quote.change_amount, quote.changeAmount,
+      quote.profit, quote.income,
+      info.estimate_amount, info.estimated_amount, info.increase_amount, info.increaseAmount,
+      holding.estimate_amount, holding.estimated_amount, holding.day_earn, holding.today_earn,
+      holding.daily_profit, holding.estimate_profit,
     );
     const estimateAmount = directEstimateAmount !== null
       ? directEstimateAmount
@@ -172,6 +212,11 @@ function normalizeRows(holdings, fundInfo, quoteById = new Map()) {
     ));
     return {
       name: String(info.short_name || info.name || holding.short_name || holding.name || id || '基金'),
+      id: String(id || ''),
+      marketValue,
+      providedRatio: providedRatio !== null && Math.abs(providedRatio) <= 1 ? providedRatio * 100 : providedRatio,
+      estimateNav,
+      lastNav,
       estimateAmount,
       estimatePct,
       estimateIsLive: liveEstimatePct !== null || directEstimateAmount !== null,
@@ -182,13 +227,24 @@ function normalizeRows(holdings, fundInfo, quoteById = new Map()) {
       quoteAvailable: estimateAmount !== null || estimatePct !== null || estimateNav !== null,
     };
   });
+  const totalMarketValue = rows.reduce((sum, row) => sum + (row.marketValue !== null ? row.marketValue : 0), 0);
+  return rows.map((row) => ({
+    ...row,
+    holdingRatio: totalMarketValue > 0 && row.marketValue !== null
+      ? row.marketValue / totalMarketValue * 100
+      : row.providedRatio,
+  }));
 }
 
 function holdingValue(row, compact, colors) {
   const estimateAmount = row.estimateAmount === null ? '--' : formatNumber(row.estimateAmount);
   const estimatePct = row.estimatePct === null ? '--' : formatNumber(row.estimatePct, '%');
   const estimateLabel = row.estimateIsLive ? '实时估值' : '最后估值';
-  const estimate = `${estimateLabel} ${estimateAmount} (${estimatePct})`;
+  const estimate = row.estimatePct !== null || row.estimateAmount !== null
+    ? `${estimateLabel} ${estimateAmount} (${estimatePct})`
+    : row.lastNav !== null
+      ? `最后净值 ${formatNav(row.lastNav)}`
+      : '最后估值 -- (--)';
   const earn = row.earn === null ? '持有收益 --' : `持有收益 ${formatNumber(row.earn)}`;
   return {
     estimate,
@@ -197,6 +253,7 @@ function holdingValue(row, compact, colors) {
     earnColor: colorFor(row.earn, colors),
     estimateAmountNumber: row.estimateAmount,
     estimatePctNumber: row.estimatePct,
+    ratio: formatRatio(row.holdingRatio),
     estimateNumber: row.estimatePct ?? row.estimateAmount,
     fontSize: compact ? 'caption2' : 'caption1',
   };
@@ -211,19 +268,31 @@ function latestQuoteTime(rows) {
 
 function mergeCachedRows(rows, cachedRows) {
   if (!Array.isArray(cachedRows) || !cachedRows.length) return rows;
+  const cachedById = new Map(cachedRows.filter((row) => row.id).map((row) => [String(row.id), row]));
   const cachedByName = new Map(cachedRows.map((row) => [String(row.name), row]));
   return rows.map((row) => {
     if (row.estimateIsLive) return row;
-    const cached = cachedByName.get(String(row.name));
+    const cached = cachedById.get(String(row.id)) || cachedByName.get(String(row.name));
     if (!cached || cached.estimatePct === null || cached.estimatePct === undefined) return row;
     return {
       ...row,
       estimateAmount: cached.estimateAmount ?? row.estimateAmount,
       estimatePct: cached.estimatePct,
       estimateIsLive: false,
+      estimateNav: cached.estimateNav ?? row.estimateNav,
+      lastNav: cached.lastNav ?? row.lastNav,
       quoteAt: cached.quoteAt || row.quoteAt,
     };
   });
+}
+
+function ensureRatios(rows) {
+  const totalMarketValue = rows.reduce((sum, row) => sum + (Number.isFinite(Number(row.marketValue)) ? Number(row.marketValue) : 0), 0);
+  if (totalMarketValue <= 0) return rows;
+  return rows.map((row) => ({
+    ...row,
+    holdingRatio: Number.isFinite(Number(row.marketValue)) ? Number(row.marketValue) / totalMarketValue * 100 : row.holdingRatio ?? null,
+  }));
 }
 
 function resolveMarketStatus(rows) {
@@ -277,9 +346,39 @@ function holdingRow(row, family, colors) {
   };
 }
 
+function denseHoldingRow(row, colors) {
+  const result = holdingValue(row, true, colors);
+  const amount = row.estimateAmount === null ? '--' : formatNumber(row.estimateAmount);
+  const pct = row.estimatePct === null ? '--' : formatNumber(row.estimatePct, '%');
+  const estimate = row.estimatePct !== null || row.estimateAmount !== null
+    ? `${row.estimateIsLive ? '实时估值' : '最后估值'} ${amount}/${pct}`
+    : row.lastNav !== null
+      ? `最后净值 ${formatNav(row.lastNav)}`
+      : '--/--';
+  const earn = row.earn === null ? '持有收益 --' : `持有收益 ${formatNumber(row.earn)}`;
+  const detail = `${estimate} ${earn} 占比 ${result.ratio}`;
+  const name = text(row.name, 'caption2', 'medium', colors.primary, 1, 0.45);
+  name.flex = 1;
+  return {
+    type: 'stack',
+    direction: 'row',
+    alignItems: 'center',
+    gap: 4,
+    children: [
+      name,
+      text(detail, 'caption2', 'regular', result.estimateColor, 1, 0.45),
+    ],
+  };
+}
+
 function makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family) {
   const compact = family === 'systemSmall' || family === 'accessoryRectangular';
   const lockScreen = family.startsWith('accessory');
+  const denseLayout = !lockScreen && (
+    family === 'systemLarge'
+    || family === 'systemExtraLarge'
+    || (family === 'systemMedium' && rows.length > 3)
+  );
   const colors = {
     primary: '#FFFFFF',
     secondary: '#A9AAB5',
@@ -315,12 +414,18 @@ function makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family
     const emptyMessage = state === '加载中' ? '正在读取持仓…' : state === '实时' ? '暂无基金持仓' : state;
     children.push(text(emptyMessage, 'subheadline', 'medium', colors.secondary, 2));
   } else {
-    const visible = rows.slice(0, family === 'systemSmall' ? 1 : family === 'systemLarge' ? 4 : family === 'systemExtraLarge' ? 8 : compact ? 1 : 2);
+    const visible = denseLayout
+      ? rows
+      : rows.slice(0, family === 'systemSmall' ? 1 : compact ? 1 : 2);
     for (const row of visible) {
-      children.push(holdingRow(row, family, colors));
+      children.push(denseLayout ? denseHoldingRow(row, colors) : holdingRow(row, family, colors));
     }
-    if (rows.length > visible.length) {
+    if (!denseLayout && rows.length > visible.length) {
       children.push(text(`另有 ${rows.length - visible.length} 只`, 'caption2', 'regular', colors.secondary));
+    }
+    if (!lockScreen) {
+      const ratioTotal = rows.reduce((sum, row) => sum + (Number.isFinite(Number(row.holdingRatio)) ? Number(row.holdingRatio) : 0), 0);
+      children.push(text(`比例合计 ${ratioTotal > 0 ? formatRatio(ratioTotal) : '--'}`, 'caption2', 'regular', colors.secondary, 1));
     }
   }
 
@@ -332,7 +437,7 @@ function makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family
     type: 'widget',
     refreshAfter: new Date(Date.now() + refreshSeconds * 1000).toISOString(),
     padding: lockScreen ? 4 : compact ? 10 : 14,
-    gap: lockScreen ? 2 : compact ? 5 : 8,
+    gap: lockScreen ? 2 : compact ? 5 : denseLayout ? 3 : 8,
     backgroundGradient: {
       type: 'linear',
       colors: ['#34364B', '#242638'],
@@ -570,15 +675,16 @@ export default async function (ctx) {
     clearTimeout(timeoutId);
     if (outcome.pending) {
       if (cache && Array.isArray(cache.rows) && Date.now() - cache.savedAt < CACHE_TTL_SECONDS * 1000) {
-        const cachedStatus = cache.marketStatus || resolveMarketStatus(cache.rows);
-        return makeWidget(cache.rows, cache.updatedAt || '--', '缓存', cachedStatus, cachedStatus === '开市' ? OPEN_REFRESH_SECONDS : ERROR_REFRESH_SECONDS, family);
+        const cachedRows = ensureRatios(cache.rows);
+        const cachedStatus = cache.marketStatus || resolveMarketStatus(cachedRows);
+        return makeWidget(cachedRows, cache.updatedAt || '--', '缓存', cachedStatus, cachedStatus === '开市' ? OPEN_REFRESH_SECONDS : ERROR_REFRESH_SECONDS, family);
       }
       return makeWidget([], '--', '加载中', marketStatus, ERROR_REFRESH_SECONDS, family);
     }
     if (!outcome.ok) throw outcome.error;
     const fetched = outcome.value;
     const fetchedRows = Array.isArray(fetched) ? fetched : fetched.rows || [];
-    rows = mergeCachedRows(fetchedRows, cache && cache.rows);
+    rows = ensureRatios(mergeCachedRows(fetchedRows, cache && cache.rows));
     marketStatus = Array.isArray(fetched) ? resolveMarketStatus(rows) : fetched.marketStatus || resolveMarketStatus(rows);
     const latest = latestQuoteTime(rows);
     updatedAt = localTime(latest || new Date());
@@ -587,7 +693,7 @@ export default async function (ctx) {
     await ctx.storage.setJSON(CACHE_KEY, { rows, marketStatus, updatedAt, savedAt: Date.now() });
   } catch (error) {
     if (cache && Array.isArray(cache.rows) && Date.now() - cache.savedAt < CACHE_TTL_SECONDS * 1000) {
-      rows = cache.rows;
+      rows = ensureRatios(cache.rows);
       updatedAt = cache.updatedAt || '--';
       marketStatus = cache.marketStatus || resolveMarketStatus(rows);
       state = `缓存 · ${String(error.message || '请求失败').slice(0, 22)}`;
