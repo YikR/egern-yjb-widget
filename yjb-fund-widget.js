@@ -1,6 +1,9 @@
 const DEFAULT_BASE = 'https://app-api.yangjibao.com';
-const CACHE_KEY = 'yjb-fund-widget-cache-v1';
+const CACHE_KEY = 'yjb-fund-widget-cache-v2';
 const CACHE_TTL_SECONDS = 60 * 60 * 24;
+const OPEN_REFRESH_SECONDS = 60;
+const CLOSED_REFRESH_SECONDS = 15 * 60;
+const ERROR_REFRESH_SECONDS = 5 * 60;
 
 function text(value, size, weight, color, maxLines = 1) {
   return {
@@ -28,6 +31,13 @@ function pickNumber(...values) {
   return null;
 }
 
+function pickText(...values) {
+  for (const value of values) {
+    if (value !== undefined && value !== null && String(value).trim() !== '') return String(value);
+  }
+  return '';
+}
+
 function unwrap(value) {
   let current = value;
   for (let i = 0; i < 3; i += 1) {
@@ -49,7 +59,80 @@ function readList(value) {
   return [];
 }
 
-function normalizeRows(holdings, fundInfo) {
+function readObject(value) {
+  const data = unwrap(value);
+  if (Array.isArray(data)) return data[0] && typeof data[0] === 'object' ? data[0] : {};
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return {};
+  if (Array.isArray(data.list)) return data.list[0] && typeof data.list[0] === 'object' ? data.list[0] : {};
+  return data.quote || data.fund || data.result || data;
+}
+
+function parseTimestamp(value, now = new Date()) {
+  if (value === undefined || value === null || value === '') return null;
+  if (typeof value === 'number' || /^\d+(\.\d+)?$/.test(String(value))) {
+    const number = Number(value);
+    const milliseconds = number < 10000000000 ? number * 1000 : number;
+    const date = new Date(milliseconds);
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+  const raw = String(value).trim();
+  const timeOnly = /^(\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(raw);
+  if (timeOnly) {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+    }).formatToParts(now);
+    const dateParts = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+    return new Date(`${dateParts.year}-${dateParts.month}-${dateParts.day}T${timeOnly[1].padStart(2, '0')}:${timeOnly[2]}:${timeOnly[3] || '00'}+08:00`);
+  }
+  const normalized = raw.replace(/年|\//g, '-').replace(/月/g, '-').replace(/日/g, '').replace(/时/g, ':').replace(/分/g, '');
+  const hasZone = /(?:Z|[+-]\d{2}:?\d{2})$/.test(normalized);
+  const dateText = normalized.includes('T') || normalized.includes(' ') ? normalized.replace(' ', 'T') : `${normalized}T00:00:00`;
+  const date = new Date(hasZone ? dateText : `${dateText}+08:00`);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function localTime(date) {
+  if (!date || Number.isNaN(new Date(date).getTime())) return '--';
+  return new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', month: '2-digit', day: '2-digit',
+  }).format(new Date(date));
+}
+
+function chinaTimeParts(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Shanghai', weekday: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  }).formatToParts(date);
+  return Object.fromEntries(parts.map((part) => [part.type, part.value]));
+}
+
+function isTradingWindow(date = new Date()) {
+  const parts = chinaTimeParts(date);
+  if (parts.weekday === 'Sat' || parts.weekday === 'Sun') return false;
+  const minutes = Number(parts.hour) * 60 + Number(parts.minute);
+  return (minutes >= 570 && minutes < 690) || (minutes >= 780 && minutes < 900);
+}
+
+function explicitMarketStatus(...values) {
+  for (const value of values) {
+    if (typeof value === 'boolean') return value ? '开市' : '休市';
+    if (value === undefined || value === null) continue;
+    const normalized = String(value).toLowerCase();
+    if (/(开市|交易中|trading|open|true|1)/.test(normalized)) return '开市';
+    if (/(休市|收市|closed|close|false|0)/.test(normalized)) return '休市';
+  }
+  return null;
+}
+
+function normalizeMarketStatus(...values) {
+  return explicitMarketStatus(...values) || (isTradingWindow() ? '开市' : '休市');
+}
+
+function colorFor(value, colors) {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return colors.secondary;
+  return Number(value) > 0 ? colors.positive : Number(value) < 0 ? colors.negative : colors.neutral;
+}
+
+function normalizeRows(holdings, fundInfo, quoteById = new Map()) {
   const infoById = new Map();
   for (const info of fundInfo) {
     if (info && info.fund_id !== undefined) infoById.set(String(info.fund_id), info);
@@ -57,26 +140,146 @@ function normalizeRows(holdings, fundInfo) {
   return holdings.map((holding) => {
     const id = holding.fund_id ?? holding.id;
     const info = infoById.get(String(id)) || {};
-    const change = pickNumber(
-      info.day_growth_rate,
-      info.increase_rate,
-      info.increaseRate,
-      info.gszzl,
-      info.rate,
-      holding.day_growth_rate,
-      holding.increase_rate,
-      holding.gszzl,
+    const quote = quoteById.get(String(id)) || {};
+    const liveEstimatePct = pickNumber(
+      quote.gszzl, quote.vgszzl, quote.zsgzzl, quote.increase_rate, quote.increaseRate,
+      quote.day_growth_rate,
     );
+    const publishedPct = pickNumber(
+      info.gszzl, info.vgszzl, info.zsgzzl, info.day_growth_rate, info.increase_rate,
+      info.increaseRate, info.rate,
+      holding.day_growth_rate, holding.increase_rate, holding.gszzl,
+    );
+    const estimatePct = liveEstimatePct ?? publishedPct;
+    const estimateNav = pickNumber(quote.gsz, quote.vgsz, quote.zsgz, quote.estimate_nav, quote.estimated_nav);
+    const lastNav = pickNumber(holding.last_net, holding.last_nav, holding.lastNet, info.last_net, info.last_nav);
+    const shares = pickNumber(holding.hold_share, holding.shares, holding.share, holding.amount_share);
+    const marketValue = pickNumber(holding.money, holding.market_value, holding.current_value, holding.total_value);
+    const directEstimateAmount = pickNumber(
+      quote.estimate_amount, quote.estimated_amount, quote.gsz_change_amount, quote.vgsz_change_amount,
+      quote.estimate_profit, quote.estimated_profit, quote.profit, quote.income,
+    );
+    const estimateAmount = directEstimateAmount !== null
+      ? directEstimateAmount
+      : estimatePct !== null && marketValue !== null
+        ? marketValue * estimatePct / 100
+        : estimatePct !== null && shares !== null && estimateNav !== null && lastNav !== null
+          ? shares * (estimateNav - lastNav)
+          : null;
+    const quoteAt = parseTimestamp(pickText(
+      quote.gztime, quote.vgsztime, quote.zsgztime, quote.quote_time, quote.update_time,
+      quote.updated_at, quote.timestamp, info.gztime, info.update_time,
+    ));
     return {
       name: String(info.short_name || info.name || holding.short_name || holding.name || id || '基金'),
-      change,
+      estimateAmount,
+      estimatePct,
+      estimateIsLive: liveEstimatePct !== null || directEstimateAmount !== null,
       earn: pickNumber(holding.hold_earn, holding.earn, holding.profit),
+      marketStatus: normalizeMarketStatus(quote.market_status, quote.marketStatus, quote.status, quote.is_open),
+      marketStatusExplicit: explicitMarketStatus(quote.market_status, quote.marketStatus, quote.status, quote.is_open) !== null,
+      quoteAt: quoteAt ? quoteAt.toISOString() : null,
+      quoteAvailable: estimateAmount !== null || estimatePct !== null || estimateNav !== null,
     };
   });
 }
 
-function makeWidget(rows, updatedAt, state, family) {
+function holdingValue(row, compact, colors) {
+  const estimateAmount = row.estimateAmount === null ? '--' : formatNumber(row.estimateAmount);
+  const estimatePct = row.estimatePct === null ? '--' : formatNumber(row.estimatePct, '%');
+  const estimateLabel = row.estimateIsLive ? '实时估值' : '最后估值';
+  const estimate = `${estimateLabel} ${estimateAmount} (${estimatePct})`;
+  const earn = row.earn === null ? '持有收益 --' : `持有收益 ${formatNumber(row.earn)}`;
+  return {
+    estimate,
+    earn,
+    estimateColor: colorFor(row.estimateAmount ?? row.estimatePct, colors),
+    earnColor: colorFor(row.earn, colors),
+    estimateAmountNumber: row.estimateAmount,
+    estimatePctNumber: row.estimatePct,
+    estimateNumber: row.estimatePct ?? row.estimateAmount,
+    fontSize: compact ? 'caption2' : 'caption1',
+  };
+}
+
+function latestQuoteTime(rows) {
+  return rows.reduce((latest, row) => {
+    const time = row.quoteAt ? new Date(row.quoteAt) : null;
+    return time && !Number.isNaN(time.getTime()) && (!latest || time > latest) ? time : latest;
+  }, null);
+}
+
+function mergeCachedRows(rows, cachedRows) {
+  if (!Array.isArray(cachedRows) || !cachedRows.length) return rows;
+  const cachedByName = new Map(cachedRows.map((row) => [String(row.name), row]));
+  return rows.map((row) => {
+    if (row.estimateIsLive) return row;
+    const cached = cachedByName.get(String(row.name));
+    if (!cached || cached.estimatePct === null || cached.estimatePct === undefined) return row;
+    return {
+      ...row,
+      estimateAmount: cached.estimateAmount ?? row.estimateAmount,
+      estimatePct: cached.estimatePct,
+      estimateIsLive: false,
+      quoteAt: cached.quoteAt || row.quoteAt,
+    };
+  });
+}
+
+function resolveMarketStatus(rows) {
+  const explicit = rows.filter((row) => row.marketStatusExplicit).map((row) => row.marketStatus);
+  if (explicit.includes('开市')) return '开市';
+  if (explicit.includes('休市')) return '休市';
+  return isTradingWindow() ? '开市' : '休市';
+}
+
+function holdingRow(row, family, colors) {
+  const narrow = family === 'systemSmall' || family === 'accessoryRectangular';
+  const lockScreen = family.startsWith('accessory');
+  const result = holdingValue(row, narrow || lockScreen, colors);
+
+  if (family === 'accessoryInline') {
+    const amount = result.estimateAmountNumber === null ? '--' : formatNumber(result.estimateAmountNumber);
+    const pct = result.estimatePctNumber === null ? '--' : formatNumber(result.estimatePctNumber, '%');
+    const earn = row.earn === null ? '--' : formatNumber(row.earn);
+    return text(`${row.name} 估${amount}/${pct} 持${earn}`, 'caption2', 'medium', colors.primary, 1);
+  }
+  if (family === 'accessoryCircular') {
+    const shortAmount = result.estimateAmountNumber === null ? '--' : formatNumber(result.estimateAmountNumber);
+    const shortPct = result.estimatePctNumber === null ? '--' : formatNumber(result.estimatePctNumber, '%');
+    const shortEarn = row.earn === null ? '--' : formatNumber(row.earn);
+    return text(`${shortAmount}/${shortPct}\n持有 ${shortEarn}`, 'caption2', 'semibold', result.estimateColor, 2);
+  }
+  if (narrow) {
+    return {
+      type: 'stack',
+      direction: 'column',
+      alignItems: 'start',
+      gap: 1,
+      children: [
+        text(row.name, 'caption1', 'medium', colors.primary, 1),
+        text(result.estimate, result.fontSize, 'semibold', result.estimateColor, 1),
+        text(result.earn, 'caption2', 'regular', result.earnColor, 1),
+      ],
+    };
+  }
+
+  return {
+    type: 'stack',
+    direction: 'column',
+    alignItems: 'start',
+    gap: 1,
+    children: [
+      text(row.name, 'subheadline', 'medium', colors.primary, 1),
+      text(result.estimate, result.fontSize, 'semibold', result.estimateColor, 1),
+      text(result.earn, 'caption2', 'regular', result.earnColor, 1),
+    ],
+  };
+}
+
+function makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family) {
   const compact = family === 'systemSmall' || family === 'accessoryRectangular';
+  const lockScreen = family.startsWith('accessory');
   const colors = {
     primary: '#FFFFFF',
     secondary: '#A9AAB5',
@@ -84,62 +287,52 @@ function makeWidget(rows, updatedAt, state, family) {
     negative: '#43C89A',
     neutral: '#E4E5EB',
   };
+  if (family === 'accessoryInline') {
+    const row = rows[0];
+    const value = row ? holdingRow(row, family, colors).text : state;
+    return {
+      type: 'widget',
+      refreshAfter: new Date(Date.now() + refreshSeconds * 1000).toISOString(),
+      children: [text(`养基宝 · ${marketStatus} · ${value}`, 'caption2', 'medium', colors.primary, 1)],
+    };
+  }
+
   const children = [
     {
       type: 'stack',
       direction: 'row',
       alignItems: 'center',
       children: [
-        text('养基宝', compact ? 'headline' : 'title3', 'bold', colors.primary),
+        text('养基宝', lockScreen ? 'caption1' : compact ? 'headline' : 'title3', 'bold', colors.primary),
         { type: 'spacer' },
-        text(state, 'caption2', 'medium', colors.secondary),
+        text(marketStatus, 'caption2', 'medium', marketStatus === '开市' ? colors.positive : colors.secondary, 1),
       ],
     },
   ];
 
   if (!rows.length) {
     children.push({ type: 'spacer' });
-    children.push(text(state === '加载中' ? '正在读取持仓…' : '暂无基金持仓', 'subheadline', 'medium', colors.secondary));
+    const emptyMessage = state === '加载中' ? '正在读取持仓…' : state === '实时' ? '暂无基金持仓' : state;
+    children.push(text(emptyMessage, 'subheadline', 'medium', colors.secondary, 2));
   } else {
-    const visible = rows.slice(0, compact ? 2 : 4);
+    const visible = rows.slice(0, family === 'systemSmall' ? 1 : family === 'systemLarge' ? 4 : family === 'systemExtraLarge' ? 8 : compact ? 1 : 2);
     for (const row of visible) {
-      const value = row.change !== null
-        ? `${formatNumber(row.change, '%')} 估值`
-        : row.earn !== null
-          ? `${formatNumber(row.earn)} 持有收益`
-          : '涨跌暂不可用';
-      const valueNumber = row.change ?? row.earn;
-      const valueColor = valueNumber === null
-        ? colors.secondary
-        : valueNumber > 0
-          ? colors.positive
-          : valueNumber < 0
-            ? colors.negative
-            : colors.neutral;
-      children.push({
-        type: 'stack',
-        direction: 'row',
-        alignItems: 'center',
-        gap: 6,
-        children: [
-          text(row.name, compact ? 'caption1' : 'subheadline', 'medium', colors.primary),
-          { type: 'spacer' },
-          text(value, compact ? 'caption2' : 'caption1', 'semibold', valueColor),
-        ],
-      });
+      children.push(holdingRow(row, family, colors));
     }
     if (rows.length > visible.length) {
       children.push(text(`另有 ${rows.length - visible.length} 只`, 'caption2', 'regular', colors.secondary));
     }
   }
 
-  children.push({ type: 'spacer' });
-  children.push(text(`更新于 ${updatedAt}`, 'caption2', 'regular', colors.secondary));
+  if (!lockScreen) {
+    children.push({ type: 'spacer' });
+    children.push(text(`${marketStatus === '开市' ? '行情更新' : '最后估值'} ${updatedAt}`, 'caption2', 'regular', colors.secondary, 1));
+  }
   return {
     type: 'widget',
-    refreshAfter: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
-    padding: compact ? 10 : 14,
-    gap: compact ? 5 : 8,
+    refreshAfter: new Date(Date.now() + refreshSeconds * 1000).toISOString(),
+    padding: lockScreen ? 4 : compact ? 10 : 14,
+    gap: lockScreen ? 2 : compact ? 5 : 8,
     backgroundGradient: {
       type: 'linear',
       colors: ['#34364B', '#242638'],
@@ -148,16 +341,6 @@ function makeWidget(rows, updatedAt, state, family) {
     },
     children,
   };
-}
-
-function localTime(date) {
-  return new Intl.DateTimeFormat('zh-CN', {
-    hour: '2-digit', minute: '2-digit', month: '2-digit', day: '2-digit',
-  }).format(date);
-}
-
-function delay(milliseconds) {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function md5(input) {
@@ -245,6 +428,37 @@ async function request(ctx, { base, path, token, secret, api, method = 'GET', bo
   }
 }
 
+async function requestQuote(ctx, options) {
+  try {
+    return readObject(await request(ctx, options));
+  } catch (_) {
+    return {};
+  }
+}
+
+async function fetchNewQuotes(ctx, { base, token, secret, policy, fundIds }) {
+  const pairs = await Promise.all(fundIds.map(async (fundId) => {
+    const estimate = await requestQuote(ctx, {
+      base,
+      path: `/market/v1/fund/gz-data?fund_id=${encodeURIComponent(fundId)}&source=1`,
+      token, secret, api: 'new', policy,
+    });
+    const hasLiveValue = pickNumber(
+      estimate.gszzl, estimate.vgszzl, estimate.zsgzzl, estimate.increase_rate,
+      estimate.increaseRate, estimate.day_growth_rate, estimate.estimate_amount,
+      estimate.estimated_amount, estimate.gsz_change_amount,
+    ) !== null;
+    if (hasLiveValue) return [String(fundId), estimate];
+    const rate = await requestQuote(ctx, {
+      base,
+      path: `/market/v1/fund/increase-rate?fund_id=${encodeURIComponent(fundId)}`,
+      token, secret, api: 'new', policy,
+    });
+    return [String(fundId), { ...rate, ...estimate }];
+  }));
+  return new Map(pairs);
+}
+
 async function fetchNew(ctx, env) {
   const token = env.YJB_TOKEN;
   const secret = env.YJB_SIGNING_SECRET;
@@ -258,7 +472,7 @@ async function fetchNew(ctx, env) {
     });
     const accounts = readList(accountData);
     accountId = accounts[0] && accounts[0].id;
-    if (!accountId) return [];
+    if (!accountId) return { rows: [], marketStatus: isTradingWindow() ? '开市' : '休市' };
   }
   const holdingsData = await request(ctx, {
     base,
@@ -266,7 +480,7 @@ async function fetchNew(ctx, env) {
     token, secret, api: 'new', policy,
   });
   const holdings = readList(holdingsData);
-  if (!holdings.length) return [];
+  if (!holdings.length) return { rows: [], marketStatus: isTradingWindow() ? '开市' : '休市' };
   const fundIds = holdings.map((holding) => holding.fund_id).filter((id) => id !== undefined && id !== null);
   const fundInfo = fundIds.length
     ? readList(await request(ctx, {
@@ -280,7 +494,11 @@ async function fetchNew(ctx, env) {
       body: { funds: fundIds.map((fund_id) => ({ fund_id, data_source: '1' })) },
     }))
     : [];
-  return normalizeRows(holdings, fundInfo);
+  const quoteById = fundIds.length
+    ? await fetchNewQuotes(ctx, { base, token, secret, policy, fundIds })
+    : new Map();
+  const rows = normalizeRows(holdings, fundInfo, quoteById);
+  return { rows, marketStatus: resolveMarketStatus(rows) };
 }
 
 async function fetchOld(ctx, env) {
@@ -300,15 +518,32 @@ async function fetchOld(ctx, env) {
     api: 'old',
     policy,
   });
-  return readList(data).map((holding) => {
+  const rows = readList(data).map((holding) => {
     const nav = holding.nv_info || {};
-    const change = pickNumber(nav.gszzl, nav.vgszzl, nav.zsgzzl, holding.day_growth_rate);
+    const estimatePct = pickNumber(nav.gszzl, nav.vgszzl, nav.zsgzzl, holding.day_growth_rate);
+    const estimateNav = pickNumber(nav.gsz, nav.vgsz, nav.zsgz);
+    const lastNav = pickNumber(holding.last_net, holding.last_nav);
+    const shares = pickNumber(holding.hold_share, holding.shares);
+    const marketValue = pickNumber(holding.money, holding.market_value);
+    const estimateAmount = estimatePct !== null && marketValue !== null
+      ? marketValue * estimatePct / 100
+      : estimatePct !== null && shares !== null && estimateNav !== null && lastNav !== null
+        ? shares * (estimateNav - lastNav)
+        : null;
+    const explicitStatus = explicitMarketStatus(nav.market_status, nav.marketStatus, nav.status, nav.is_open);
+    const quoteAt = parseTimestamp(pickText(nav.gztime, nav.vgsztime, nav.zsgztime, nav.update_time, nav.updated_at));
     return {
       name: String(holding.short_name || holding.name || holding.code || '基金'),
-      change,
+      estimateAmount,
+      estimatePct,
+      estimateIsLive: true,
       earn: pickNumber(holding.hold_earn),
+      marketStatus: explicitStatus || (isTradingWindow() ? '开市' : '休市'),
+      marketStatusExplicit: explicitStatus !== null,
+      quoteAt: quoteAt ? quoteAt.toISOString() : null,
     };
   });
+  return { rows, marketStatus: resolveMarketStatus(rows) };
 }
 
 export default async function (ctx) {
@@ -318,6 +553,8 @@ export default async function (ctx) {
   let rows = [];
   let state = '加载中';
   let updatedAt = '--';
+  let marketStatus = isTradingWindow() ? '开市' : '休市';
+  let refreshSeconds = marketStatus === '开市' ? OPEN_REFRESH_SECONDS : CLOSED_REFRESH_SECONDS;
   let cache;
 
   try {
@@ -325,28 +562,40 @@ export default async function (ctx) {
     const fetchPromise = (api === 'old' ? fetchOld(ctx, env) : fetchNew(ctx, env))
       .then((value) => ({ ok: true, value }))
       .catch((error) => ({ ok: false, error }));
-    const outcome = await Promise.race([
-      fetchPromise,
-      delay(6000).then(() => ({ pending: true })),
-    ]);
+    let timeoutId;
+    const timeoutPromise = new Promise((resolve) => {
+      timeoutId = setTimeout(() => resolve({ pending: true }), 12000);
+    });
+    const outcome = await Promise.race([fetchPromise, timeoutPromise]);
+    clearTimeout(timeoutId);
     if (outcome.pending) {
-      return makeWidget([], '--', '加载中', family);
+      if (cache && Array.isArray(cache.rows) && Date.now() - cache.savedAt < CACHE_TTL_SECONDS * 1000) {
+        const cachedStatus = cache.marketStatus || resolveMarketStatus(cache.rows);
+        return makeWidget(cache.rows, cache.updatedAt || '--', '缓存', cachedStatus, cachedStatus === '开市' ? OPEN_REFRESH_SECONDS : ERROR_REFRESH_SECONDS, family);
+      }
+      return makeWidget([], '--', '加载中', marketStatus, ERROR_REFRESH_SECONDS, family);
     }
     if (!outcome.ok) throw outcome.error;
     const fetched = outcome.value;
-    rows = fetched;
-    updatedAt = localTime(new Date());
+    const fetchedRows = Array.isArray(fetched) ? fetched : fetched.rows || [];
+    rows = mergeCachedRows(fetchedRows, cache && cache.rows);
+    marketStatus = Array.isArray(fetched) ? resolveMarketStatus(rows) : fetched.marketStatus || resolveMarketStatus(rows);
+    const latest = latestQuoteTime(rows);
+    updatedAt = localTime(latest || new Date());
     state = '实时';
-    await ctx.storage.setJSON(CACHE_KEY, { rows, updatedAt, savedAt: Date.now() });
+    refreshSeconds = marketStatus === '开市' ? OPEN_REFRESH_SECONDS : CLOSED_REFRESH_SECONDS;
+    await ctx.storage.setJSON(CACHE_KEY, { rows, marketStatus, updatedAt, savedAt: Date.now() });
   } catch (error) {
     if (cache && Array.isArray(cache.rows) && Date.now() - cache.savedAt < CACHE_TTL_SECONDS * 1000) {
       rows = cache.rows;
       updatedAt = cache.updatedAt || '--';
+      marketStatus = cache.marketStatus || resolveMarketStatus(rows);
       state = `缓存 · ${String(error.message || '请求失败').slice(0, 22)}`;
     } else {
       state = String(error.message || '请求失败').slice(0, 28);
     }
+    refreshSeconds = marketStatus === '开市' ? OPEN_REFRESH_SECONDS : ERROR_REFRESH_SECONDS;
   }
 
-  return makeWidget(rows, updatedAt, state, family);
+  return makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family);
 }
