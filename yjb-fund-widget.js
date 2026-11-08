@@ -190,15 +190,18 @@ function normalizeRows(holdings, fundInfo, quoteById = new Map()) {
       holding.money, holding.market_value, holding.current_value, holding.total_value,
       holding.marketValue, holding.assets, holding.asset_value,
     ) ?? (shares !== null && (estimateNav ?? lastNav) !== null ? shares * (estimateNav ?? lastNav) : null);
-    const directEstimateAmount = pickNumber(
+    const quoteEstimateAmount = pickNumber(
       quote.estimate_amount, quote.estimated_amount, quote.gsz_change_amount, quote.vgsz_change_amount,
       quote.estimate_profit, quote.estimated_profit, quote.estimateProfit, quote.estimatedProfit,
       quote.increase_amount, quote.increaseAmount, quote.change_amount, quote.changeAmount,
       quote.profit, quote.income,
+    );
+    const supplementalEstimateAmount = pickNumber(
       info.estimate_amount, info.estimated_amount, info.increase_amount, info.increaseAmount,
       holding.estimate_amount, holding.estimated_amount, holding.day_earn, holding.today_earn,
       holding.daily_profit, holding.estimate_profit,
     );
+    const directEstimateAmount = quoteEstimateAmount ?? supplementalEstimateAmount;
     const estimateAmount = directEstimateAmount !== null
       ? directEstimateAmount
       : estimatePct !== null && marketValue !== null
@@ -219,7 +222,7 @@ function normalizeRows(holdings, fundInfo, quoteById = new Map()) {
       lastNav,
       estimateAmount,
       estimatePct,
-      estimateIsLive: liveEstimatePct !== null || directEstimateAmount !== null,
+      estimateIsLive: liveEstimatePct !== null || quoteEstimateAmount !== null,
       earn: pickNumber(holding.hold_earn, holding.earn, holding.profit),
       marketStatus: normalizeMarketStatus(quote.market_status, quote.marketStatus, quote.status, quote.is_open),
       marketStatusExplicit: explicitMarketStatus(quote.market_status, quote.marketStatus, quote.status, quote.is_open) !== null,
