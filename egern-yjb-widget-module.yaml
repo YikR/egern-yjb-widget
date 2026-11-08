@@ -27,7 +27,7 @@ env_schema:
 scriptings:
   - generic:
       name: 养基宝持仓
-      script_url: https://raw.githubusercontent.com/YikR/egern-yjb-widget/main/yjb-fund-widget.js
+      script_url: https://raw.githubusercontent.com/YikR/egern-yjb-widget/main/yjb-fund-widget.js?v=20261109-2
       update_interval: 86400
       timeout: 20
 

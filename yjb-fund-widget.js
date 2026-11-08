@@ -7,6 +7,8 @@ const ERROR_REFRESH_SECONDS = 5 * 60;
 const QUOTE_CONCURRENCY = 3;
 const QUOTE_ATTEMPTS = 2;
 const QUOTE_RETRY_DELAY_MS = 180;
+const HTTP_TIMEOUT_MS = 6000;
+const FETCH_DEADLINE_MS = 16000;
 
 function text(value, size, weight, color, maxLines = 1, minScale = 0.7) {
   return {
@@ -551,9 +553,15 @@ async function request(ctx, { base, path, token, secret, api, method = 'GET', bo
     'Request-Sign': buildSignature(base, path, token, secret, timestamp, api),
     Authorization: api === 'new' ? `ios:${token}` : token,
     'Content-Type': 'application/json',
-    Accept: 'application/json',
+    Accept: api === 'new' ? '*/*' : 'application/json',
   };
-  const options = { headers, timeout: 12000 };
+  if (api === 'new') {
+    headers['Accept-Language'] = 'zh-Hans-CN;q=1.0, en-CN;q=0.9';
+    headers['Accept-Encoding'] = 'gzip, deflate';
+    headers['User-Agent'] = 'YJB/2.0.13 (com.xiaoduotou.yjb; build:975; iOS 26.5.0) Alamofire/5.10.2 iPad8,6';
+    headers.Cookie = 'cna=1c1bb34ac9014f8ab07e6e9943d98cb9';
+  }
+  const options = { headers, timeout: HTTP_TIMEOUT_MS };
   if (policy) options.policy = policy;
   if (body) options.body = body;
   const response = method === 'POST'
@@ -632,17 +640,20 @@ async function mapWithConcurrency(items, limit, worker) {
 async function fetchNewQuotes(ctx, { base, token, secret, policy, fundIds }) {
   const uniqueFundIds = [...new Set(fundIds.map((id) => String(id)))];
   const pairs = await mapWithConcurrency(uniqueFundIds, QUOTE_CONCURRENCY, async (fundId) => {
-    const estimate = await requestQuoteWithRetry(ctx, {
-      base,
-      path: `/market/v1/fund/gz-data?fund_id=${encodeURIComponent(fundId)}&source=1`,
-      token, secret, api: 'new', policy,
-    }, QUOTE_ATTEMPTS);
-    if (hasDailyRate(estimate)) return [fundId, estimate];
+    // The rate endpoint is the lightest endpoint and contains the fields needed by
+    // the widget. Query it first so a slow valuation endpoint cannot starve later funds.
     const rate = await requestQuoteWithRetry(ctx, {
       base,
       path: `/market/v1/fund/increase-rate?fund_id=${encodeURIComponent(fundId)}`,
       token, secret, api: 'new', policy,
     }, QUOTE_ATTEMPTS, true);
+    if (hasDailyRate(rate)) return [fundId, rate];
+
+    const estimate = await requestQuoteWithRetry(ctx, {
+      base,
+      path: `/market/v1/fund/gz-data?fund_id=${encodeURIComponent(fundId)}&source=1`,
+      token, secret, api: 'new', policy,
+    }, 1);
     return [fundId, { ...estimate, ...rate }];
   });
   return new Map(pairs);
@@ -753,7 +764,7 @@ export default async function (ctx) {
       .catch((error) => ({ ok: false, error }));
     let timeoutId;
     const timeoutPromise = new Promise((resolve) => {
-      timeoutId = setTimeout(() => resolve({ pending: true }), 12000);
+      timeoutId = setTimeout(() => resolve({ pending: true }), FETCH_DEADLINE_MS);
     });
     const outcome = await Promise.race([fetchPromise, timeoutPromise]);
     clearTimeout(timeoutId);

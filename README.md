@@ -21,6 +21,8 @@
 添加模块后，打开 Egern 的小组件图库，在“模块小组件”中找到“养基宝持仓”并添加到主屏幕或锁屏。模块里的脚本会通过同仓库的 GitHub Raw 地址加载：
 `https://raw.githubusercontent.com/YikR/egern-yjb-widget/main/yjb-fund-widget.js`
 
+如果已经安装过旧模块，请在模块详情中执行一次刷新/重新保存；无法立即刷新时可删除旧模块后用上面的远程模块配置重新添加。模块脚本 URL 带有版本参数，用于避免 Egern 或网络缓存继续使用旧脚本。
+
 ## 凭据与认证
 
 默认使用 HTTPS App API `https://app-api.yangjibao.com`。脚本从 Egern 模块环境读取 Token 和签名密钥，按接口要求生成请求签名；仓库文件不包含账户凭据。脚本不会执行登录，也不会收集手机号或验证码。令牌失效后，在本机更新 Egern 模块 Env 中的 Token。
@@ -50,7 +52,7 @@ python3 -c 'import json, pathlib; print(json.loads(pathlib.Path.home().joinpath(
 
 默认使用 `https://app-api.yangjibao.com`。每个请求都使用 Token、模块内置的签名常量和当前 Unix 时间戳计算 `Request-Sign`，并发送 `Authorization: ios:<token>`、`Request-Time`、`Request-Sign`。如你在本机部署了兼容网关，可用 `YJB_API_BASE` 改为该地址；网关仍需按 API 文档验证签名。脚本不会执行登录，也不会收集手机号或验证码。令牌失效时，重新运行短信登录并更新本地环境中的 `YJB_TOKEN`。
 
-脚本默认使用 HTTPS 新接口。代码保留旧接口兼容分支，但旧接口基于 HTTP，不建议启用。
+脚本默认使用 HTTPS 新接口，并优先请求轻量的 `increase-rate` 行情接口，再按需回退到估值接口；代码保留旧接口兼容分支，但旧接口基于 HTTP，不建议启用。
 
 ## 状态与限制
 
