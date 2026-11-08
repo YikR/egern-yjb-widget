@@ -24,9 +24,11 @@ function formatNumber(value, suffix = '') {
 
 function pickNumber(...values) {
   for (const value of values) {
-    if (value !== undefined && value !== null && value !== '' && Number.isFinite(Number(value))) {
-      return Number(value);
-    }
+    if (value === undefined || value === null || value === '') continue;
+    const normalized = typeof value === 'string'
+      ? value.trim().replace(/,/g, '').replace(/[％%]/g, '').replace(/^[¥￥]/, '')
+      : value;
+    if (Number.isFinite(Number(normalized))) return Number(normalized);
   }
   return null;
 }
@@ -66,8 +68,13 @@ function readObject(value) {
   const data = unwrap(value);
   if (Array.isArray(data)) return data[0] && typeof data[0] === 'object' ? data[0] : {};
   if (!data || typeof data !== 'object' || Array.isArray(data)) return {};
-  if (Array.isArray(data.list)) return data.list[0] && typeof data.list[0] === 'object' ? data.list[0] : {};
-  return data.quote || data.fund || data.result || data;
+  for (const key of ['list', 'items', 'rows', 'funds', 'fund_list']) {
+    if (Array.isArray(data[key])) return data[key][0] && typeof data[key][0] === 'object' ? data[key][0] : {};
+  }
+  for (const key of ['quote', 'fund', 'result', 'quote_data', 'fund_data', 'gz_data']) {
+    if (data[key] && typeof data[key] === 'object') return readObject(data[key]);
+  }
+  return data;
 }
 
 function parseTimestamp(value, now = new Date()) {
@@ -165,14 +172,19 @@ function normalizeRows(holdings, fundInfo, quoteById = new Map()) {
     const quote = quoteById.get(String(id)) || {};
     const liveDailyPct = pickNumber(
       quote.gszzl, quote.vgszzl, quote.zsgzzl, quote.increase_rate, quote.increaseRate,
-      quote.day_growth_rate, quote.change_percent, quote.changePercent,
+      quote.day_growth_rate, quote.dayGrowthRate, quote.change_percent, quote.changePercent,
+      quote.change_rate, quote.changeRate, quote.rate, quote.growth_rate, quote.growthRate,
+      quote.rise_rate, quote.riseRate, quote.weighted_increase_rate, quote.average_increase_rate,
+      quote.weightedIncreaseRate, quote.averageIncreaseRate, quote.increase, quote.change,
     );
     const publishedDailyPct = pickNumber(
       info.gszzl, info.vgszzl, info.zsgzzl, info.day_growth_rate, info.dayGrowthRate,
       info.increase_rate, info.increaseRate, info.rate, info.change_percent, info.changePercent,
       info.growth_rate, info.growthRate, info.rise_rate, info.riseRate,
+      info.change_rate, info.changeRate, info.increase, info.change,
       holding.day_growth_rate, holding.dayGrowthRate, holding.increase_rate, holding.increaseRate,
-      holding.gszzl, holding.vgszzl, holding.zsgzzl,
+      holding.gszzl, holding.vgszzl, holding.zsgzzl, holding.change_rate, holding.changeRate,
+      holding.rate, holding.growth_rate, holding.growthRate,
     );
     const estimateNav = pickNumber(
       quote.gsz, quote.vgsz, quote.zsgz, quote.estimate_nav, quote.estimated_nav,
@@ -200,13 +212,17 @@ function normalizeRows(holdings, fundInfo, quoteById = new Map()) {
       quote.estimate_profit, quote.estimated_profit, quote.estimateProfit, quote.estimatedProfit,
       quote.increase_amount, quote.increaseAmount, quote.change_amount, quote.changeAmount,
       quote.daily_change_amount, quote.dailyChangeAmount, quote.day_earn, quote.today_earn,
-      quote.daily_profit, quote.profit, quote.income,
+      quote.daily_profit, quote.dailyProfit, quote.today_profit, quote.todayProfit,
+      quote.day_income, quote.dayIncome, quote.profit_today, quote.profitToday,
+      quote.profit, quote.income, quote.change, quote.today_change, quote.todayChange,
     );
     const supplementalDailyChangeAmount = pickNumber(
       info.estimate_amount, info.estimated_amount, info.increase_amount, info.increaseAmount,
       info.daily_change_amount, info.dailyChangeAmount, info.day_earn, info.today_earn, info.daily_profit,
       holding.estimate_amount, holding.estimated_amount, holding.daily_change_amount,
       holding.dailyChangeAmount, holding.day_earn, holding.today_earn, holding.daily_profit,
+      holding.dailyProfit, holding.today_profit, holding.todayProfit, holding.day_income, holding.dayIncome,
+      holding.today_change, holding.todayChange,
     );
     const directDailyChangeAmount = quoteDailyChangeAmount ?? supplementalDailyChangeAmount;
     const dailyChangeAmount = directDailyChangeAmount !== null
@@ -218,7 +234,7 @@ function normalizeRows(holdings, fundInfo, quoteById = new Map()) {
           : null;
     const quoteAt = parseTimestamp(pickText(
       quote.gztime, quote.vgsztime, quote.zsgztime, quote.quote_time, quote.update_time,
-      quote.updated_at, quote.timestamp, info.gztime, info.update_time,
+      quote.updated_at, quote.timestamp, quote.server_time, info.gztime, info.update_time,
     ));
     return {
       name: String(info.short_name || info.name || holding.short_name || holding.name || id || '基金'),
@@ -238,18 +254,17 @@ function normalizeRows(holdings, fundInfo, quoteById = new Map()) {
 }
 
 function dailyChangeValue(row, compact, colors, options) {
-  const suffix = row.dailyChangeIsLive ? '' : '（最后有效）';
   const candidates = [];
   if (options.showDailyAmount) {
     candidates.push({
       key: 'amount',
-      text: `当日涨幅金额${suffix} ${row.dailyChangeAmount === null ? '--' : formatNumber(row.dailyChangeAmount)}`,
+      text: `当日涨幅金额 ${row.dailyChangeAmount === null ? '--' : formatNumber(row.dailyChangeAmount)}`,
     });
   }
   if (options.showDailyPct) {
     candidates.push({
       key: 'pct',
-      text: `当日涨幅${suffix} ${row.dailyChangePct === null ? '--' : formatNumber(row.dailyChangePct, '%')}`,
+      text: `当日涨幅 ${row.dailyChangePct === null ? '--' : formatNumber(row.dailyChangePct, '%')}`,
     });
   }
   const fields = candidates.slice(0, options.maxFields);
@@ -375,6 +390,7 @@ function denseHoldingRow(row, colors, options) {
 function makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family, options) {
   const compact = family === 'systemSmall' || family === 'accessoryRectangular';
   const lockScreen = family.startsWith('accessory');
+  const statusLabel = marketStatus === '开市' ? '开市' : '休市（最后有效）';
   const denseLayout = !lockScreen && (
     family === 'systemLarge'
     || family === 'systemExtraLarge'
@@ -393,7 +409,7 @@ function makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family
     return {
       type: 'widget',
       refreshAfter: new Date(Date.now() + refreshSeconds * 1000).toISOString(),
-      children: [text(`养基宝 · ${marketStatus} · 字段上限 ${options.maxFields} · ${value}`, 'caption2', 'medium', colors.primary, 1)],
+      children: [text(`养基宝 · ${statusLabel} · ${value}`, 'caption2', 'medium', colors.primary, 1)],
     };
   }
 
@@ -405,8 +421,7 @@ function makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family
       children: [
         text('养基宝', lockScreen ? 'caption1' : compact ? 'headline' : 'title3', 'bold', colors.primary),
         { type: 'spacer' },
-        text(`字段上限 ${options.maxFields}`, 'caption2', 'regular', colors.secondary, 1, 0.6),
-        text(marketStatus, 'caption2', 'medium', marketStatus === '开市' ? colors.positive : colors.secondary, 1),
+        text(statusLabel, 'caption2', 'medium', marketStatus === '开市' ? colors.positive : colors.secondary, 1),
       ],
     },
   ];
@@ -429,7 +444,7 @@ function makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family
 
   if (!lockScreen) {
     children.push({ type: 'spacer' });
-    children.push(text(`${marketStatus === '开市' ? '涨幅更新' : '最后有效涨幅'} ${updatedAt}`, 'caption2', 'regular', colors.secondary, 1));
+    children.push(text(`字段上限 ${options.maxFields} · ${marketStatus === '开市' ? '涨幅更新' : '最后有效涨幅'} ${updatedAt}`, 'caption2', 'regular', colors.secondary, 1));
   }
   return {
     type: 'widget',
@@ -548,9 +563,15 @@ async function fetchNewQuotes(ctx, { base, token, secret, policy, fundIds }) {
     });
     const hasDailyValue = pickNumber(
       estimate.gszzl, estimate.vgszzl, estimate.zsgzzl, estimate.increase_rate,
-      estimate.increaseRate, estimate.day_growth_rate, estimate.estimate_amount,
+      estimate.increaseRate, estimate.day_growth_rate, estimate.dayGrowthRate,
+      estimate.change_rate, estimate.changeRate, estimate.rate, estimate.change,
+      estimate.weighted_increase_rate, estimate.average_increase_rate,
+      estimate.weightedIncreaseRate, estimate.averageIncreaseRate,
+      estimate.estimate_amount,
       estimate.estimated_amount, estimate.gsz_change_amount, estimate.daily_change_amount,
       estimate.dailyChangeAmount, estimate.day_earn, estimate.today_earn, estimate.daily_profit,
+      estimate.dailyProfit, estimate.today_profit, estimate.todayProfit, estimate.today_change,
+      estimate.todayChange,
     ) !== null;
     if (hasDailyValue) return [String(fundId), estimate];
     const rate = await requestQuote(ctx, {
