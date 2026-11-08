@@ -1,0 +1,30 @@
+name: 养基宝基金持仓
+description: 在 Egern 小组件中显示基金持仓、当日估值涨跌和更新时间。
+author: YikR
+homepage: https://github.com/YikR/egern-yjb-widget
+manual: https://github.com/YikR/egern-yjb-widget#readme
+
+env_schema:
+  YJB_TOKEN:
+    name: 养基宝登录令牌
+    description: 只在 Egern 的本机模块 Env 中填写，不要提交到 GitHub 或发送到聊天。
+  YJB_SIGNING_SECRET:
+    name: API 签名密钥
+    description: 按养基宝 API 文档获取，并只保存在 Egern 的本机模块 Env 中。
+  YJB_ACCOUNT_ID:
+    name: 基金账户 ID（可选）
+    description: 留空时读取账号返回的第一个基金账户。
+  YJB_POLICY:
+    name: 请求策略组（可选）
+    description: 填写 Egern 中已有的策略组名称；留空时使用默认策略。
+
+scriptings:
+  - generic:
+      name: 养基宝持仓
+      script_url: https://raw.githubusercontent.com/YikR/egern-yjb-widget/main/yjb-fund-widget.js
+      update_interval: 86400
+      timeout: 20
+
+widgets:
+  - name: 养基宝持仓
+    script_name: 养基宝持仓

@@ -1,26 +1,33 @@
 # Egern 养基宝持仓小组件
 
-组件脚本使用养基宝 API 仓库记录的新 App API：先取基金账户列表（除非手动指定账户 ID），再读取该账户持仓，并用批量基金接口补全名称和可用的日涨跌幅字段。收益优先显示估值涨跌幅；接口没有提供该值时回退显示持有收益。Egern 按系统调度刷新，因此“实时”表示每次组件运行时重新请求，不保证秒级刷新。
+此仓库提供一个 Egern 远程模块，在桌面或锁屏小组件中显示基金名称、当日估值涨跌（接口无该字段时回退到持有收益）及更新时间。每次 Egern 刷新小组件时重新请求数据；系统调度不保证秒级实时更新。
 
-## 文件
+## 远程安装
 
-- `yjb-fund-widget.js`：Egern generic 脚本。
-- `yjb-widget-config.yaml`：合并到配置中的 `scriptings` 和 `widgets` 条目。
+在 Egern 中打开“工具 → 模块”，点“+”并填写：
 
-## 配置步骤
+- 名称：`养基宝基金持仓`（可选）
+- 文件位置：远程
+- URL：`https://raw.githubusercontent.com/YikR/egern-yjb-widget/main/egern-yjb-widget-module.yaml`
+- 更新间隔：留空使用 Egern 默认的 86400 秒，或自行设置
+- 启用：打开
 
-1. 将 `yjb-fund-widget.js` 放到 Egern 主配置 `Godx.yaml` 同一目录。当前使用的配置是 iCloud Egern Documents 中的 `Godx.yaml`；本工作区只提供待合并文件，不直接修改该外部配置。
-2. 将 `yjb-widget-config.yaml` 中的两条数组项合并到 `Godx.yaml` 的 `scriptings:` 与 `widgets:` 下。不要把顶层 `scriptings:`、`widgets:` 键重复粘贴到已有配置。
-3. 在 Egern 的“养基宝持仓”小组件环境中填写 `YJB_TOKEN` 和 `YJB_SIGNING_SECRET`。不要把真实值发到聊天、提交到 Git，或放入脚本源文件。仓库 README 说明新接口 Token 可由手机号验证码登录取得；仓库文档也包含固定签名密钥。该密钥不是用户密码，但属于 API 签名材料，应只保存在本机配置中。
-4. `YJB_ACCOUNT_ID` 留空时，脚本读取第一个基金账户；填写账户 ID 可固定读取某个账户。
-5. 如需让请求走某个 Egern 策略组，在 `YJB_POLICY` 填入策略组名；留空则使用 Egern 默认请求策略。
-6. 保存并让 Egern 重新加载配置，然后在 Egern 的小组件列表添加“养基宝持仓”。中号组件显示最多 4 只，小号/矩形组件显示最多 2 只。
+保存后编辑该模块，在“环境变量”中填写 `YJB_TOKEN` 和 `YJB_SIGNING_SECRET`。不要把真实值发到聊天或提交到 GitHub。`YJB_ACCOUNT_ID` 和 `YJB_POLICY` 为可选项；账户 ID 留空时使用第一个基金账户，策略组留空时走 Egern 默认策略。模块文件声明的环境变量会由 Egern 自动生成输入项。
+
+添加模块后，打开 Egern 的小组件图库，在“模块小组件”中找到“养基宝持仓”并添加到主屏幕或锁屏。模块里的脚本会通过同仓库的 GitHub Raw 地址加载：
+`https://raw.githubusercontent.com/YikR/egern-yjb-widget/main/yjb-fund-widget.js`
+
+## 凭据与认证
+
+默认使用 HTTPS App API `https://app-api.yangjibao.com`。脚本从 Egern 模块环境读取 Token 和签名密钥，按接口要求生成请求签名；仓库文件不包含账户凭据。脚本不会执行登录，也不会收集手机号或验证码。令牌失效后，在本机更新 Egern 模块 Env 中的 Token。
+
+`YJB_SIGNING_SECRET` 是接口签名材料，按养基宝 API 文档获取后只填入 Egern 本机模块 Env。不要将其写入模块 YAML、脚本、公开配置或聊天消息。若要让数据请求经指定策略组发出，可设置 `YJB_POLICY` 为现有策略组名称。
 
 ## 请求与认证
 
 默认使用 `https://app-api.yangjibao.com`。每个请求都使用 Token、Unix 时间戳及本地 `YJB_SIGNING_SECRET` 计算 `Request-Sign`，并发送 `Authorization: ios:<token>`、`Request-Time`、`Request-Sign`。如你在本机部署了兼容网关，可用 `YJB_API_BASE` 改为该地址；网关仍需按 API 文档验证签名。脚本不会执行登录，也不会收集手机号或验证码。令牌失效时需在养基宝仓库工具支持的登录流程中重新登录，并把新 Token 更新到本地环境配置。
 
-`YJB_API: old` 可切换至旧接口，但旧接口基于 HTTP；出于凭据传输安全，建议保持默认 HTTPS 新接口。旧接口还必须填写 `YJB_ACCOUNT_ID`。
+脚本默认使用 HTTPS 新接口。代码保留旧接口兼容分支，但旧接口基于 HTTP，不建议启用。
 
 ## 状态与限制
 
@@ -30,6 +37,10 @@
 - 养基宝接口字段可能变化。批量接口当前没有在仓库 CLI 输出中证明具体的涨跌幅字段，因此脚本尝试常见字段；若接口不返回涨跌幅，会清楚回退到持有收益或显示“涨跌暂不可用”。
 - 小组件刷新由 iOS/Egern 系统调度控制，`ctx` API 不保证秒级推送更新。
 
-## 验证
+## 本地配置安装
 
-工作区验证包括 JavaScript 语法检查、YAML 解析，以及使用模拟的 Egern HTTP/存储上下文检查成功、空持仓、缺少凭据和缓存回退状态。真实账户端到端验证需要在 Egern 本机填写有效 Token/签名密钥后执行。
+如果不使用模块管理，可将 `yjb-fund-widget.js` 放在配置文件旁边，并将 `yjb-widget-config.yaml` 中的 `scriptings` 与 `widgets` 两项合并到 Egern 配置。不要同时安装本地条目和远程模块，否则可能产生同名小组件。
+
+## 验证与限制
+
+基金接口字段可能变化。脚本尝试读取常见日涨跌字段；接口未返回时回退显示持有收益或“涨跌暂不可用”。组件刷新由 iOS/Egern 系统调度控制。真实账户端到端验证需要在 Egern 本机填写有效 Token 和签名密钥。
