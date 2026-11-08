@@ -14,6 +14,15 @@ env_schema:
   YJB_POLICY:
     name: 请求策略组（可选）
     description: 填写 Egern 中已有的策略组名称；留空时使用默认策略。
+  YJB_SHOW_DAILY_CHANGE_AMOUNT:
+    name: 显示当日涨幅金额（0/1）
+    description: 设为 1 显示当日涨幅金额，设为 0 隐藏；默认 1。
+  YJB_SHOW_DAILY_CHANGE_PCT:
+    name: 显示当日涨幅（0/1）
+    description: 设为 1 显示当日涨幅百分比，设为 0 隐藏；默认 1。
+  YJB_MAX_FIELDS:
+    name: 最多显示字段数（0-2）
+    description: 每只基金最多显示的涨幅字段数，不含基金名称；0 表示不显示金额和百分比，默认 2。
 
 scriptings:
   - generic:

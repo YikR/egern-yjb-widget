@@ -135,6 +135,25 @@ function colorFor(value, colors) {
   return Number(value) > 0 ? colors.positive : Number(value) < 0 ? colors.negative : colors.neutral;
 }
 
+function readToggle(env, key, defaultValue = true) {
+  if (String(env[key] ?? '').trim() === '0') return false;
+  if (String(env[key] ?? '').trim() === '1') return true;
+  return defaultValue;
+}
+
+function readMaxFields(env) {
+  const value = Number.parseInt(String(env.YJB_MAX_FIELDS ?? '2'), 10);
+  return Number.isFinite(value) ? Math.max(0, Math.min(2, value)) : 2;
+}
+
+function displayOptions(env = {}) {
+  return {
+    showDailyAmount: readToggle(env, 'YJB_SHOW_DAILY_CHANGE_AMOUNT', true),
+    showDailyPct: readToggle(env, 'YJB_SHOW_DAILY_CHANGE_PCT', true),
+    maxFields: readMaxFields(env),
+  };
+}
+
 function normalizeRows(holdings, fundInfo, quoteById = new Map()) {
   const infoById = new Map();
   for (const info of fundInfo) {
@@ -218,18 +237,26 @@ function normalizeRows(holdings, fundInfo, quoteById = new Map()) {
   });
 }
 
-function dailyChangeValue(row, compact, colors) {
-  const dailyChangeAmount = row.dailyChangeAmount === null ? '--' : formatNumber(row.dailyChangeAmount);
-  const dailyChangePct = row.dailyChangePct === null ? '--' : formatNumber(row.dailyChangePct, '%');
-  const dailyChangeLabel = row.dailyChangeIsLive ? '当日涨幅' : '当日涨幅（最后有效）';
+function dailyChangeValue(row, compact, colors, options) {
+  const suffix = row.dailyChangeIsLive ? '' : '（最后有效）';
+  const candidates = [];
+  if (options.showDailyAmount) {
+    candidates.push({
+      key: 'amount',
+      text: `当日涨幅金额${suffix} ${row.dailyChangeAmount === null ? '--' : formatNumber(row.dailyChangeAmount)}`,
+    });
+  }
+  if (options.showDailyPct) {
+    candidates.push({
+      key: 'pct',
+      text: `当日涨幅${suffix} ${row.dailyChangePct === null ? '--' : formatNumber(row.dailyChangePct, '%')}`,
+    });
+  }
+  const fields = candidates.slice(0, options.maxFields);
   return {
-    dailyChange: row.dailyChangePct !== null || row.dailyChangeAmount !== null
-      ? `${dailyChangeLabel} ${dailyChangeAmount} (${dailyChangePct})`
-      : '当日涨幅 --',
+    fields,
+    dailyChange: fields.length ? fields.map((field) => field.text).join(compact ? ' / ' : '\n') : '当日涨幅字段已关闭',
     dailyChangeColor: colorFor(row.dailyChangeAmount ?? row.dailyChangePct, colors),
-    dailyChangeAmountNumber: row.dailyChangeAmount,
-    dailyChangePctNumber: row.dailyChangePct,
-    dailyChangeNumber: row.dailyChangePct ?? row.dailyChangeAmount,
     fontSize: compact ? 'caption2' : 'caption1',
   };
 }
@@ -286,22 +313,21 @@ function resolveMarketStatus(rows) {
   return isTradingWindow() ? '开市' : '休市';
 }
 
-function holdingRow(row, family, colors) {
+function holdingRow(row, family, colors, options) {
   const narrow = family === 'systemSmall' || family === 'accessoryRectangular';
   const lockScreen = family.startsWith('accessory');
-  const result = dailyChangeValue(row, narrow || lockScreen, colors);
+  const result = dailyChangeValue(row, narrow || lockScreen, colors, options);
 
   if (family === 'accessoryInline') {
-    const amount = result.dailyChangeAmountNumber === null ? '--' : formatNumber(result.dailyChangeAmountNumber);
-    const pct = result.dailyChangePctNumber === null ? '--' : formatNumber(result.dailyChangePctNumber, '%');
-    return text(`${row.name} 当日涨幅 ${amount}/${pct}`, 'caption2', 'medium', colors.primary, 1);
+    return text(`${row.name} ${result.fields.length ? result.fields.map((field) => field.text).join(' / ') : result.dailyChange}`, 'caption2', 'medium', colors.primary, 1);
   }
   if (family === 'accessoryCircular') {
-    const shortAmount = result.dailyChangeAmountNumber === null ? '--' : formatNumber(result.dailyChangeAmountNumber);
-    const shortPct = result.dailyChangePctNumber === null ? '--' : formatNumber(result.dailyChangePctNumber, '%');
-    return text(`当日涨幅\n${shortAmount}/${shortPct}`, 'caption2', 'semibold', result.dailyChangeColor, 2);
+    return text(result.fields.length ? result.fields.map((field) => field.text).join('\n') : result.dailyChange, 'caption2', 'semibold', result.dailyChangeColor, 2);
   }
   if (narrow) {
+    const fieldNodes = result.fields.length
+      ? result.fields.map((field) => text(field.text, result.fontSize, 'semibold', result.dailyChangeColor, 1))
+      : [text(result.dailyChange, result.fontSize, 'semibold', result.dailyChangeColor, 1)];
     return {
       type: 'stack',
       direction: 'column',
@@ -309,11 +335,14 @@ function holdingRow(row, family, colors) {
       gap: 1,
       children: [
         text(row.name, 'caption1', 'medium', colors.primary, 1),
-        text(result.dailyChange, result.fontSize, 'semibold', result.dailyChangeColor, 1),
+        ...fieldNodes,
       ],
     };
   }
 
+  const fieldNodes = result.fields.length
+    ? result.fields.map((field) => text(field.text, result.fontSize, 'semibold', result.dailyChangeColor, 1))
+    : [text(result.dailyChange, result.fontSize, 'semibold', result.dailyChangeColor, 1)];
   return {
     type: 'stack',
     direction: 'column',
@@ -321,18 +350,14 @@ function holdingRow(row, family, colors) {
     gap: 1,
     children: [
       text(row.name, 'subheadline', 'medium', colors.primary, 1),
-      text(result.dailyChange, result.fontSize, 'semibold', result.dailyChangeColor, 1),
+      ...fieldNodes,
     ],
   };
 }
 
-function denseHoldingRow(row, colors) {
-  const result = dailyChangeValue(row, true, colors);
-  const amount = row.dailyChangeAmount === null ? '--' : formatNumber(row.dailyChangeAmount);
-  const pct = row.dailyChangePct === null ? '--' : formatNumber(row.dailyChangePct, '%');
-  const detail = row.dailyChangePct !== null || row.dailyChangeAmount !== null
-    ? `${row.dailyChangeIsLive ? '当日涨幅' : '当日涨幅（最后有效）'} ${amount}/${pct}`
-    : '当日涨幅 --';
+function denseHoldingRow(row, colors, options) {
+  const result = dailyChangeValue(row, true, colors, options);
+  const detail = result.fields.length ? result.fields.map((field) => field.text).join(' · ') : result.dailyChange;
   const name = text(row.name, 'caption2', 'medium', colors.primary, 1, 0.45);
   name.flex = 1;
   return {
@@ -347,7 +372,7 @@ function denseHoldingRow(row, colors) {
   };
 }
 
-function makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family) {
+function makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family, options) {
   const compact = family === 'systemSmall' || family === 'accessoryRectangular';
   const lockScreen = family.startsWith('accessory');
   const denseLayout = !lockScreen && (
@@ -364,11 +389,11 @@ function makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family
   };
   if (family === 'accessoryInline') {
     const row = rows[0];
-    const value = row ? holdingRow(row, family, colors).text : state;
+    const value = row ? holdingRow(row, family, colors, options).text : state;
     return {
       type: 'widget',
       refreshAfter: new Date(Date.now() + refreshSeconds * 1000).toISOString(),
-      children: [text(`养基宝 · ${marketStatus} · ${value}`, 'caption2', 'medium', colors.primary, 1)],
+      children: [text(`养基宝 · ${marketStatus} · 字段上限 ${options.maxFields} · ${value}`, 'caption2', 'medium', colors.primary, 1)],
     };
   }
 
@@ -380,6 +405,7 @@ function makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family
       children: [
         text('养基宝', lockScreen ? 'caption1' : compact ? 'headline' : 'title3', 'bold', colors.primary),
         { type: 'spacer' },
+        text(`字段上限 ${options.maxFields}`, 'caption2', 'regular', colors.secondary, 1, 0.6),
         text(marketStatus, 'caption2', 'medium', marketStatus === '开市' ? colors.positive : colors.secondary, 1),
       ],
     },
@@ -394,7 +420,7 @@ function makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family
       ? rows
       : rows.slice(0, family === 'systemSmall' ? 1 : compact ? 1 : 2);
     for (const row of visible) {
-      children.push(denseLayout ? denseHoldingRow(row, colors) : holdingRow(row, family, colors));
+      children.push(denseLayout ? denseHoldingRow(row, colors, options) : holdingRow(row, family, colors, options));
     }
     if (!denseLayout && rows.length > visible.length) {
       children.push(text(`另有 ${rows.length - visible.length} 只`, 'caption2', 'regular', colors.secondary));
@@ -627,6 +653,7 @@ export default async function (ctx) {
   const env = ctx.env || {};
   const api = env.YJB_API === 'old' ? 'old' : 'new';
   const family = ctx.widgetFamily || 'systemMedium';
+  const options = displayOptions(env);
   let rows = [];
   let state = '加载中';
   let updatedAt = '--';
@@ -649,9 +676,9 @@ export default async function (ctx) {
       if (cache && Array.isArray(cache.rows) && Date.now() - cache.savedAt < CACHE_TTL_SECONDS * 1000) {
         const cachedRows = normalizeCachedRows(cache.rows);
         const cachedStatus = cache.marketStatus || resolveMarketStatus(cachedRows);
-        return makeWidget(cachedRows, cache.updatedAt || '--', '缓存', cachedStatus, cachedStatus === '开市' ? OPEN_REFRESH_SECONDS : ERROR_REFRESH_SECONDS, family);
+        return makeWidget(cachedRows, cache.updatedAt || '--', '缓存', cachedStatus, cachedStatus === '开市' ? OPEN_REFRESH_SECONDS : ERROR_REFRESH_SECONDS, family, options);
       }
-      return makeWidget([], '--', '加载中', marketStatus, ERROR_REFRESH_SECONDS, family);
+      return makeWidget([], '--', '加载中', marketStatus, ERROR_REFRESH_SECONDS, family, options);
     }
     if (!outcome.ok) throw outcome.error;
     const fetched = outcome.value;
@@ -675,5 +702,5 @@ export default async function (ctx) {
     refreshSeconds = marketStatus === '开市' ? OPEN_REFRESH_SECONDS : ERROR_REFRESH_SECONDS;
   }
 
-  return makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family);
+  return makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family, options);
 }
