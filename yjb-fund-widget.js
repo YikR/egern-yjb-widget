@@ -4,6 +4,9 @@ const CACHE_TTL_SECONDS = 60 * 60 * 24;
 const OPEN_REFRESH_SECONDS = 60;
 const CLOSED_REFRESH_SECONDS = 15 * 60;
 const ERROR_REFRESH_SECONDS = 5 * 60;
+const QUOTE_CONCURRENCY = 3;
+const QUOTE_ATTEMPTS = 2;
+const QUOTE_RETRY_DELAY_MS = 180;
 
 function text(value, size, weight, color, maxLines = 1, minScale = 0.7) {
   return {
@@ -61,6 +64,14 @@ function readList(value) {
   if (data && Array.isArray(data.items)) return data.items;
   if (data && Array.isArray(data.rows)) return data.rows;
   if (data && Array.isArray(data.fund_list)) return data.fund_list;
+  if (data && typeof data === 'object') {
+    const values = Object.values(data);
+    if (values.length
+      && values.every((item) => item && typeof item === 'object' && !Array.isArray(item))
+      && values.some((item) => fundIdOf(item) !== null)) {
+      return values;
+    }
+  }
   return [];
 }
 
@@ -75,6 +86,12 @@ function readObject(value) {
     if (data[key] && typeof data[key] === 'object') return readObject(data[key]);
   }
   return data;
+}
+
+function fundIdOf(value) {
+  if (!value || typeof value !== 'object') return null;
+  return value.fund_id ?? value.fundId ?? value.fund_code ?? value.fundCode
+    ?? value.id ?? value.code ?? null;
 }
 
 function parseTimestamp(value, now = new Date()) {
@@ -164,10 +181,11 @@ function displayOptions(env = {}) {
 function normalizeRows(holdings, fundInfo, quoteById = new Map()) {
   const infoById = new Map();
   for (const info of fundInfo) {
-    if (info && info.fund_id !== undefined) infoById.set(String(info.fund_id), info);
+    const id = fundIdOf(info);
+    if (id !== null && id !== undefined) infoById.set(String(id), info);
   }
   return holdings.map((holding) => {
-    const id = holding.fund_id ?? holding.id;
+    const id = fundIdOf(holding);
     const info = infoById.get(String(id)) || {};
     const quote = quoteById.get(String(id)) || {};
     const liveDailyPct = pickNumber(
@@ -182,9 +200,12 @@ function normalizeRows(holdings, fundInfo, quoteById = new Map()) {
       info.increase_rate, info.increaseRate, info.rate, info.change_percent, info.changePercent,
       info.growth_rate, info.growthRate, info.rise_rate, info.riseRate,
       info.change_rate, info.changeRate, info.increase, info.change,
+      info.weighted_increase_rate, info.average_increase_rate,
+      info.weightedIncreaseRate, info.averageIncreaseRate,
       holding.day_growth_rate, holding.dayGrowthRate, holding.increase_rate, holding.increaseRate,
       holding.gszzl, holding.vgszzl, holding.zsgzzl, holding.change_rate, holding.changeRate,
-      holding.rate, holding.growth_rate, holding.growthRate,
+      holding.rate, holding.growth_rate, holding.growthRate, holding.weighted_increase_rate,
+      holding.average_increase_rate, holding.weightedIncreaseRate, holding.averageIncreaseRate,
     );
     const estimateNav = pickNumber(
       quote.gsz, quote.vgsz, quote.zsgz, quote.estimate_nav, quote.estimated_nav,
@@ -234,10 +255,12 @@ function normalizeRows(holdings, fundInfo, quoteById = new Map()) {
           : null;
     const quoteAt = parseTimestamp(pickText(
       quote.gztime, quote.vgsztime, quote.zsgztime, quote.quote_time, quote.update_time,
-      quote.updated_at, quote.timestamp, quote.server_time, info.gztime, info.update_time,
+      quote.updated_at, quote.timestamp, quote.server_time, quote.serverTime,
+      info.gztime, info.update_time, info.updated_at, info.timestamp, info.server_time,
     ));
     return {
-      name: String(info.short_name || info.name || holding.short_name || holding.name || id || '基金'),
+      name: String(info.short_name || info.name || info.fund_name || info.fundName
+        || holding.short_name || holding.name || holding.fund_name || holding.fundName || id || '基金'),
       id: String(id || ''),
       marketValue,
       estimateNav,
@@ -554,33 +577,74 @@ async function requestQuote(ctx, options) {
   }
 }
 
+function hasDailyRate(quote = {}) {
+  return pickNumber(
+    quote.gszzl, quote.vgszzl, quote.zsgzzl, quote.increase_rate, quote.increaseRate,
+    quote.day_growth_rate, quote.dayGrowthRate, quote.change_percent, quote.changePercent,
+    quote.change_rate, quote.changeRate, quote.rate, quote.growth_rate, quote.growthRate,
+    quote.rise_rate, quote.riseRate, quote.weighted_increase_rate, quote.average_increase_rate,
+    quote.weightedIncreaseRate, quote.averageIncreaseRate, quote.increase, quote.change,
+  ) !== null;
+}
+
+function hasDailyAmount(quote = {}) {
+  return pickNumber(
+    quote.estimate_amount, quote.estimated_amount, quote.gsz_change_amount,
+    quote.vgsz_change_amount, quote.estimate_profit, quote.estimated_profit,
+    quote.estimateProfit, quote.estimatedProfit, quote.increase_amount,
+    quote.increaseAmount, quote.change_amount, quote.changeAmount,
+    quote.daily_change_amount, quote.dailyChangeAmount, quote.day_earn,
+    quote.today_earn, quote.daily_profit, quote.dailyProfit, quote.today_profit,
+    quote.todayProfit, quote.day_income, quote.dayIncome, quote.profit_today,
+    quote.profitToday, quote.profit, quote.income, quote.today_change, quote.todayChange,
+  ) !== null;
+}
+
+async function requestQuoteWithRetry(ctx, options, attempts = QUOTE_ATTEMPTS, requireRate = false) {
+  let result = {};
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    result = await requestQuote(ctx, options);
+    const complete = requireRate ? hasDailyRate(result) : hasDailyRate(result) || hasDailyAmount(result);
+    if (complete) return result;
+    if (attempt + 1 < attempts) {
+      await new Promise((resolve) => setTimeout(resolve, QUOTE_RETRY_DELAY_MS * (attempt + 1)));
+    }
+  }
+  return result;
+}
+
+async function mapWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(Math.max(1, limit), items.length);
+  const runners = Array.from({ length: workerCount }, async () => {
+    while (true) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= items.length) return;
+      results[index] = await worker(items[index], index);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
+
 async function fetchNewQuotes(ctx, { base, token, secret, policy, fundIds }) {
-  const pairs = await Promise.all(fundIds.map(async (fundId) => {
-    const estimate = await requestQuote(ctx, {
+  const uniqueFundIds = [...new Set(fundIds.map((id) => String(id)))];
+  const pairs = await mapWithConcurrency(uniqueFundIds, QUOTE_CONCURRENCY, async (fundId) => {
+    const estimate = await requestQuoteWithRetry(ctx, {
       base,
       path: `/market/v1/fund/gz-data?fund_id=${encodeURIComponent(fundId)}&source=1`,
       token, secret, api: 'new', policy,
-    });
-    const hasDailyValue = pickNumber(
-      estimate.gszzl, estimate.vgszzl, estimate.zsgzzl, estimate.increase_rate,
-      estimate.increaseRate, estimate.day_growth_rate, estimate.dayGrowthRate,
-      estimate.change_rate, estimate.changeRate, estimate.rate, estimate.change,
-      estimate.weighted_increase_rate, estimate.average_increase_rate,
-      estimate.weightedIncreaseRate, estimate.averageIncreaseRate,
-      estimate.estimate_amount,
-      estimate.estimated_amount, estimate.gsz_change_amount, estimate.daily_change_amount,
-      estimate.dailyChangeAmount, estimate.day_earn, estimate.today_earn, estimate.daily_profit,
-      estimate.dailyProfit, estimate.today_profit, estimate.todayProfit, estimate.today_change,
-      estimate.todayChange,
-    ) !== null;
-    if (hasDailyValue) return [String(fundId), estimate];
-    const rate = await requestQuote(ctx, {
+    }, QUOTE_ATTEMPTS);
+    if (hasDailyRate(estimate)) return [fundId, estimate];
+    const rate = await requestQuoteWithRetry(ctx, {
       base,
       path: `/market/v1/fund/increase-rate?fund_id=${encodeURIComponent(fundId)}`,
       token, secret, api: 'new', policy,
-    });
-    return [String(fundId), { ...rate, ...estimate }];
-  }));
+    }, QUOTE_ATTEMPTS, true);
+    return [fundId, { ...estimate, ...rate }];
+  });
   return new Map(pairs);
 }
 
@@ -606,7 +670,7 @@ async function fetchNew(ctx, env) {
   });
   const holdings = readList(holdingsData);
   if (!holdings.length) return { rows: [], marketStatus: isTradingWindow() ? '开市' : '休市' };
-  const fundIds = holdings.map((holding) => holding.fund_id).filter((id) => id !== undefined && id !== null);
+  const fundIds = holdings.map(fundIdOf).filter((id) => id !== undefined && id !== null);
   const fundInfo = fundIds.length
     ? readList(await request(ctx, {
       base,
