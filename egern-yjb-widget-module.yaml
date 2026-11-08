@@ -1,5 +1,5 @@
 name: 养基宝基金持仓
-description: 在 Egern 小组件中显示全部可用基金持仓、实时或最后估值涨跌金额与涨跌幅、持有收益、持仓比例、开市状态和更新时间。
+description: 在 Egern 小组件中显示全部可用基金持仓、当日涨幅金额与涨跌幅、开市状态和更新时间。
 author: YikR
 homepage: https://github.com/YikR/egern-yjb-widget
 manual: https://github.com/YikR/egern-yjb-widget#readme
