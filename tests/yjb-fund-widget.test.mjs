@@ -59,6 +59,9 @@ async function testFamilies() {
     assert(values.some((value) => value.includes('当日涨幅')), `${family} missing daily fields`);
     assert(values.some((value) => value.includes('开市')), `${family} missing market status`);
     assert(!values.some((value) => /持有收益|占比|字段上限/.test(value)), `${family} renders removed fields`);
+    if (!family.startsWith('accessory')) {
+      assert(values.some((value) => value.includes('Token 验证成功')), `${family} missing token status`);
+    }
   }
 }
 
@@ -93,6 +96,7 @@ async function testClosedStateAndFallbackParsing() {
   const values = nodes.map((node) => String(node.text));
   const dots = nodes.filter((node) => node.text === '●');
   assert(values.some((value) => value.includes('休市 · 最后成功')));
+  assert(values.some((value) => value.includes('Token 验证成功')));
   assert(values.some((value) => value.includes('休市基金一'))
     && values.some((value) => value.includes('休市基金二'))
     && values.some((value) => value.includes('无净值基金')));
@@ -204,10 +208,32 @@ async function testAmountOnlyPrimarySource() {
   assert.equal(estimateCalls, 0, 'amount-only primary quote should not trigger fallbacks');
 }
 
+async function testTokenConfigurationStates() {
+  const missingValues = textNodes(await widget({
+    env: { YJB_SIGNING_SECRET: 'test' },
+    widgetFamily: 'systemMedium',
+    storage: storage(),
+    http: { get: async () => response({}), post: async () => response({}) },
+  })).map((node) => String(node.text));
+  assert(missingValues.some((value) => value.includes('Token 验证失败 · 未配置')));
+
+  const invalidValues = textNodes(await widget({
+    env: { YJB_TOKEN: 'expired', YJB_SIGNING_SECRET: 'test' },
+    widgetFamily: 'systemMedium',
+    storage: storage(),
+    http: {
+      get: async () => ({ status: 401, json: async () => ({ code: 401, message: 'unauthorized' }) }),
+      post: async () => response({}),
+    },
+  })).map((node) => String(node.text));
+  assert(invalidValues.some((value) => value.includes('Token 验证失败 · 令牌无效')));
+}
+
 await testFamilies();
 await testClosedStateAndFallbackParsing();
 await testClosedLatestNavUsesGreenIndicator();
 await testStorageFailureDoesNotHideData();
 await testSourceCircuitBreakerAndBatchFallback();
 await testAmountOnlyPrimarySource();
-console.log('PASS: widget families, closed-state semantics, response wrappers, and storage-failure isolation');
+await testTokenConfigurationStates();
+console.log('PASS: widget families, token states, closed-state semantics, response wrappers, and storage-failure isolation');

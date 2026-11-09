@@ -51,7 +51,9 @@ function unwrap(value) {
   for (let i = 0; i < 3; i += 1) {
     if (!current || typeof current !== 'object' || Array.isArray(current)) break;
     if (current.code !== undefined && Number(current.code) !== 200) {
-      throw new Error(current.message || `API 返回错误 (${current.code})`);
+      const error = new Error(current.message || `API 返回错误 (${current.code})`);
+      error.code = Number(current.code);
+      throw error;
     }
     if (current.data !== undefined) current = current.data;
     else break;
@@ -129,6 +131,45 @@ function localTime(date) {
   return new Intl.DateTimeFormat('zh-CN', {
     timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', month: '2-digit', day: '2-digit',
   }).format(new Date(date));
+}
+
+function createTokenState(token) {
+  return {
+    status: token ? 'pending' : 'missing',
+    attemptedAt: null,
+    verifiedAt: null,
+    reason: token ? '' : '未配置',
+  };
+}
+
+function markTokenAttempt(tokenState) {
+  if (!tokenState || tokenState.status === 'success') return;
+  tokenState.attemptedAt = Date.now();
+}
+
+function markTokenSuccess(tokenState) {
+  if (!tokenState) return;
+  tokenState.status = 'success';
+  tokenState.verifiedAt = tokenState.verifiedAt || Date.now();
+  tokenState.reason = '';
+}
+
+function markTokenFailure(tokenState, reason = '请求失败', invalid = false) {
+  if (!tokenState || tokenState.status === 'success') return;
+  tokenState.status = invalid ? 'invalid' : 'error';
+  tokenState.attemptedAt = tokenState.attemptedAt || Date.now();
+  tokenState.reason = reason;
+}
+
+function tokenStatusText(tokenState) {
+  const state = tokenState || { status: 'unknown' };
+  const time = localTime(state.verifiedAt || state.attemptedAt);
+  if (state.status === 'success') return `Token 验证成功 · ${time}`;
+  if (state.status === 'missing') return 'Token 验证失败 · 未配置';
+  if (state.status === 'invalid') return `Token 验证失败 · 令牌无效 · ${time}`;
+  if (state.status === 'error') return `Token 验证失败 · ${state.reason || '请求失败'} · ${time}`;
+  if (state.status === 'pending') return `Token 验证中 · ${time}`;
+  return 'Token 未验证 · 暂无时间';
 }
 
 function chinaTimeParts(date = new Date()) {
@@ -565,7 +606,7 @@ function denseHoldingRow(row, colors, options, liveWindow = true, marketStatus =
   };
 }
 
-function makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family, options, dataStatus = null) {
+function makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family, options, dataStatus = null, tokenState = null) {
   const compact = family === 'systemSmall' || family.startsWith('accessory');
   const lockScreen = family.startsWith('accessory');
   const resolvedDataStatus = dataStatus || resolveDataStatus(rows, marketStatus, state === '加载中' ? 'loading' : state === '实时' ? 'success' : 'error');
@@ -639,7 +680,7 @@ function makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family
   if (!lockScreen) {
     children.push({ type: 'spacer' });
     children.push(text(
-      freshnessText(marketStatus, resolvedDataStatus, displayUpdateTime(updatedAt, rows, resolvedDataStatus), rows),
+      tokenStatusText(tokenState),
       'caption2',
       'regular',
       colors.secondary,
@@ -721,7 +762,8 @@ function buildSignature(base, path, token, secret, timestamp, api) {
   return md5(source);
 }
 
-async function request(ctx, { base, path, token, secret, api, method = 'GET', body, policy }) {
+async function request(ctx, { base, path, token, secret, api, method = 'GET', body, policy, tokenState }) {
+  markTokenAttempt(tokenState);
   const timestamp = Math.floor(Date.now() / 1000);
   const headers = {
     'Request-Time': String(timestamp),
@@ -739,16 +781,35 @@ async function request(ctx, { base, path, token, secret, api, method = 'GET', bo
   const options = { headers, timeout: HTTP_TIMEOUT_MS };
   if (policy) options.policy = policy;
   if (body) options.body = body;
-  const response = method === 'POST'
-    ? await ctx.http.post(`${base}${path}`, options)
-    : await ctx.http.get(`${base}${path}`, options);
+  let response;
+  try {
+    response = method === 'POST'
+      ? await ctx.http.post(`${base}${path}`, options)
+      : await ctx.http.get(`${base}${path}`, options);
+  } catch (error) {
+    markTokenFailure(tokenState, '网络错误');
+    throw error;
+  }
   if (response.status < 200 || response.status >= 300) {
-    throw new Error(response.status === 401 ? '登录令牌已失效，请重新登录' : `HTTP ${response.status}`);
+    const invalid = response.status === 401 || response.status === 403;
+    markTokenFailure(tokenState, invalid ? '令牌无效' : `HTTP ${response.status}`, invalid);
+    throw new Error(invalid ? '登录令牌已失效，请重新登录' : `HTTP ${response.status}`);
+  }
+  let payload;
+  try {
+    payload = await response.json();
+  } catch (_) {
+    markTokenFailure(tokenState, '响应解析失败');
+    throw new Error('服务返回的内容无法解析');
   }
   try {
-    return unwrap(await response.json());
-  } catch (_) {
-    throw new Error('服务返回的内容无法解析');
+    const result = unwrap(payload);
+    markTokenSuccess(tokenState);
+    return result;
+  } catch (error) {
+    const invalid = Number(error && error.code) === 401 || Number(error && error.code) === 403;
+    markTokenFailure(tokenState, invalid ? '令牌无效' : '请求失败', invalid);
+    throw error;
   }
 }
 
@@ -815,12 +876,12 @@ function historyNav(item) {
   );
 }
 
-async function fetchHistoryQuote(ctx, { base, token, secret, policy, fundId }) {
+async function fetchHistoryQuote(ctx, { base, token, secret, policy, fundId, tokenState }) {
   try {
     const data = await request(ctx, {
       base,
       path: `/market/v1/fund-nav/fund-history-nav?fund_id=${encodeURIComponent(fundId)}`,
-      token, secret, api: 'new', policy,
+      token, secret, api: 'new', policy, tokenState,
     });
     const history = readList(data)
       .filter((item) => item && typeof item === 'object')
@@ -907,7 +968,7 @@ async function requestQuoteSource(health, sourceKey, runner) {
   return {};
 }
 
-async function fetchNewQuotes(ctx, { base, token, secret, policy, fundIds }) {
+async function fetchNewQuotes(ctx, { base, token, secret, policy, fundIds, tokenState }) {
   const uniqueFundIds = [...new Set(fundIds.map((id) => String(id)))];
   const sourceHealth = createQuoteSourceHealth();
   const pairs = await mapWithConcurrency(uniqueFundIds, QUOTE_CONCURRENCY, async (fundId) => {
@@ -916,27 +977,27 @@ async function fetchNewQuotes(ctx, { base, token, secret, policy, fundIds }) {
     const rate = await requestQuoteSource(sourceHealth, 'increase-rate', () => requestQuoteWithRetry(ctx, {
       base,
       path: `/market/v1/fund/increase-rate?fund_id=${encodeURIComponent(fundId)}`,
-      token, secret, api: 'new', policy,
+      token, secret, api: 'new', policy, tokenState,
     }, QUOTE_ATTEMPTS, true));
     if (hasUsableQuote(rate)) return [fundId, { ...rate, _quoteSource: 'realtime' }];
 
     const estimate = await requestQuoteSource(sourceHealth, 'gz-data', () => requestQuoteWithRetry(ctx, {
       base,
       path: `/market/v1/fund/gz-data?fund_id=${encodeURIComponent(fundId)}&source=1`,
-      token, secret, api: 'new', policy,
+      token, secret, api: 'new', policy, tokenState,
     }, 1));
     let merged = { ...estimate, ...rate };
     if (!hasUsableQuote(merged)) {
       const overview = await requestQuoteSource(sourceHealth, 'overview', () => requestQuote(ctx, {
         base,
         path: `/market/v1/fund/overview?data_source=1&fund_id=${encodeURIComponent(fundId)}`,
-        token, secret, api: 'new', policy,
+        token, secret, api: 'new', policy, tokenState,
       }));
       merged = { ...overview, ...merged, _quoteSource: 'overview' };
     }
     if (!hasUsableQuote(merged)) {
       const history = await requestQuoteSource(sourceHealth, 'history', () => fetchHistoryQuote(ctx, {
-        base, token, secret, policy, fundId,
+        base, token, secret, policy, fundId, tokenState,
       }));
       merged = { ...history, ...merged, _quoteSource: 'history' };
     }
@@ -946,16 +1007,20 @@ async function fetchNewQuotes(ctx, { base, token, secret, policy, fundIds }) {
   return new Map(pairs);
 }
 
-async function fetchNew(ctx, env) {
+async function fetchNew(ctx, env, tokenState) {
   const token = env.YJB_TOKEN;
   const secret = env.YJB_SIGNING_SECRET;
   const base = (env.YJB_API_BASE || DEFAULT_BASE).replace(/\/+$/, '');
   const policy = env.YJB_POLICY || '';
-  if (!token || !secret) throw new Error('请在小组件配置中填写 YJB_TOKEN 和 YJB_SIGNING_SECRET');
+  if (!token || !secret) {
+    if (!token) tokenState.status = 'missing';
+    else markTokenFailure(tokenState, '签名密钥未配置');
+    throw new Error('请在小组件配置中填写 YJB_TOKEN 和 YJB_SIGNING_SECRET');
+  }
   let accountId = env.YJB_ACCOUNT_ID;
   if (!accountId) {
     const accountData = await request(ctx, {
-      base, path: '/users/v1/user-account', token, secret, api: 'new', policy,
+      base, path: '/users/v1/user-account', token, secret, api: 'new', policy, tokenState,
     });
     const accounts = readList(accountData);
     accountId = accounts[0] && accounts[0].id;
@@ -965,6 +1030,7 @@ async function fetchNew(ctx, env) {
     base,
     path: `/position/v1/static/fund-accounts/${encodeURIComponent(accountId)}/funds`,
     token, secret, api: 'new', policy,
+    tokenState,
   });
   const holdings = readList(holdingsData);
   if (!holdings.length) return { rows: [], marketStatus: isTradingWindow() ? '开市' : '休市' };
@@ -982,6 +1048,7 @@ async function fetchNew(ctx, env) {
         secret,
         api: 'new',
         policy,
+        tokenState,
         method: 'POST',
         body: { funds: fundIds.map((fund_id) => ({ fund_id, data_source: '1' })) },
       }));
@@ -993,17 +1060,19 @@ async function fetchNew(ctx, env) {
   }
   const explicitStatus = explicitStatusFromRecords([...holdings, ...fundInfo]);
   const quoteById = fundIds.length && explicitStatus !== '休市'
-    ? await fetchNewQuotes(ctx, { base, token, secret, policy, fundIds })
+    ? await fetchNewQuotes(ctx, { base, token, secret, policy, fundIds, tokenState })
     : new Map();
   const rows = normalizeRows(holdings, fundInfo, quoteById);
   return { rows, marketStatus: resolveMarketStatus(rows) };
 }
 
-async function fetchOld(ctx, env) {
+async function fetchOld(ctx, env, tokenState) {
   const token = env.YJB_TOKEN;
   const secret = env.YJB_SIGNING_SECRET;
   const accountId = env.YJB_ACCOUNT_ID;
   if (!token || !secret || !accountId) {
+    if (!token) tokenState.status = 'missing';
+    else if (!secret || !accountId) markTokenFailure(tokenState, '旧接口配置不完整');
     throw new Error('旧接口需要配置 YJB_TOKEN、YJB_SIGNING_SECRET 和 YJB_ACCOUNT_ID');
   }
   const base = (env.YJB_API_BASE || 'http://browser-plug-api.yangjibao.com').replace(/\/+$/, '');
@@ -1015,6 +1084,7 @@ async function fetchOld(ctx, env) {
     secret,
     api: 'old',
     policy,
+    tokenState,
   });
   const rows = readList(data).map((holding) => {
     const nav = holding.nv_info || {};
@@ -1070,6 +1140,7 @@ export default async function (ctx) {
   const api = env.YJB_API === 'old' ? 'old' : 'new';
   const family = ctx.widgetFamily || 'systemMedium';
   const options = displayOptions(env);
+  const tokenState = createTokenState(env.YJB_TOKEN);
   let rows = [];
   let state = '加载中';
   let updatedAt = '--';
@@ -1080,7 +1151,7 @@ export default async function (ctx) {
 
   try {
     cache = await readCache(ctx);
-    const fetchPromise = (api === 'old' ? fetchOld(ctx, env) : fetchNew(ctx, env))
+    const fetchPromise = (api === 'old' ? fetchOld(ctx, env, tokenState) : fetchNew(ctx, env, tokenState))
       .then((value) => ({ ok: true, value }))
       .catch((error) => ({ ok: false, error }));
     let timeoutId;
@@ -1094,9 +1165,9 @@ export default async function (ctx) {
         const cachedRows = normalizeCachedRows(cache.rows);
         const cachedStatus = cache.marketStatus || resolveMarketStatus(cachedRows);
         const cachedUpdatedAt = cache.updatedAt || (cache.lastSuccessAt ? localTime(new Date(cache.lastSuccessAt)) : '--');
-        return makeWidget(cachedRows, cachedUpdatedAt, '缓存', cachedStatus, cachedStatus === '开市' ? OPEN_REFRESH_SECONDS : ERROR_REFRESH_SECONDS, family, options, resolveDataStatus(cachedRows, cachedStatus, 'error'));
+        return makeWidget(cachedRows, cachedUpdatedAt, '缓存', cachedStatus, cachedStatus === '开市' ? OPEN_REFRESH_SECONDS : ERROR_REFRESH_SECONDS, family, options, resolveDataStatus(cachedRows, cachedStatus, 'error'), tokenState);
       }
-      return makeWidget([], '--', '加载中', marketStatus, ERROR_REFRESH_SECONDS, family, options, 'loading');
+      return makeWidget([], '--', '加载中', marketStatus, ERROR_REFRESH_SECONDS, family, options, 'loading', tokenState);
     }
     if (!outcome.ok) throw outcome.error;
     const fetched = outcome.value;
@@ -1123,5 +1194,5 @@ export default async function (ctx) {
     refreshSeconds = marketStatus === '开市' ? OPEN_REFRESH_SECONDS : ERROR_REFRESH_SECONDS;
   }
 
-  return makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family, options, dataStatus);
+  return makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family, options, dataStatus, tokenState);
 }
