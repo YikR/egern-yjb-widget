@@ -74,6 +74,7 @@ async function testClosedStateAndFallbackParsing() {
         if (url.includes('/fund-accounts/')) return response({ list: [
           { fund_id: 201, money: 1000, market_status: 'closed' },
           { fund_id: 202, money: 1000, market_status: 'closed' },
+          { fund_id: 203, market_status: 'closed' },
         ] });
         if (url.includes('/fund/')) {
           quoteCalls += 1;
@@ -84,6 +85,7 @@ async function testClosedStateAndFallbackParsing() {
       post: async () => response({ result: {
         one: { fund_id: 201, short_name: '休市基金一', day_growth_rate: 1 },
         two: { fund_id: 202, short_name: '休市基金二', day_growth_rate: -1 },
+        three: { fund_id: 203, short_name: '无净值基金' },
       } }),
     },
   };
@@ -91,10 +93,41 @@ async function testClosedStateAndFallbackParsing() {
   const values = nodes.map((node) => String(node.text));
   const dots = nodes.filter((node) => node.text === '●');
   assert(values.some((value) => value.includes('休市 · 最后成功')));
-  assert(values.some((value) => value.includes('休市基金一')) && values.some((value) => value.includes('休市基金二')));
+  assert(values.some((value) => value.includes('休市基金一'))
+    && values.some((value) => value.includes('休市基金二'))
+    && values.some((value) => value.includes('无净值基金')));
   assert.equal(quoteCalls, 0, 'closed market should not request quote fallbacks');
+  assert.equal(dots.length, 3);
+  assert.deepEqual(dots.map((node) => node.textColor), ['#FF5B5B', '#FF5B5B', '#A9AAB5']);
+}
+
+async function testClosedLatestNavUsesGreenIndicator() {
+  const ctx = {
+    env: { YJB_TOKEN: 'test', YJB_SIGNING_SECRET: 'test' },
+    widgetFamily: 'systemLarge',
+    storage: storage(),
+    http: {
+      get: async (url) => {
+        if (url.includes('/users/v1/user-account')) return response({ list: [{ id: 1 }] });
+        if (url.includes('/fund-accounts/')) return response({ list: [
+          { fund_id: 211, money: 1000, market_status: 'closed' },
+          { fund_id: 212, money: 1000, last_net: 1.12, market_status: 'closed' },
+        ] });
+        if (url.includes('/increase-rate') || url.includes('/gz-data') || url.includes('/fund/overview') || url.includes('/fund-history-nav')) {
+          throw new Error(`closed market should not request quote source: ${url}`);
+        }
+        throw new Error(url);
+      },
+      post: async () => response({ result: {
+        one: { fund_id: 211, short_name: '已获取净值', nav: 1.2345, market_status: 'closed', day_growth_rate: 0.5 },
+        two: { fund_id: 212, short_name: '持仓返回最新净值', market_status: 'closed', day_growth_rate: -0.5 },
+      } }),
+    },
+  };
+  const nodes = textNodes(await widget(ctx));
+  const dots = nodes.filter((node) => node.text === '●');
   assert.equal(dots.length, 2);
-  assert(dots.every((node) => node.textColor === '#FF5B5B'), 'closed values must be marked delayed');
+  assert.deepEqual(dots.map((node) => node.textColor), ['#43C89A', '#43C89A']);
 }
 
 async function testStorageFailureDoesNotHideData() {
@@ -173,6 +206,7 @@ async function testAmountOnlyPrimarySource() {
 
 await testFamilies();
 await testClosedStateAndFallbackParsing();
+await testClosedLatestNavUsesGreenIndicator();
 await testStorageFailureDoesNotHideData();
 await testSourceCircuitBreakerAndBatchFallback();
 await testAmountOnlyPrimarySource();
