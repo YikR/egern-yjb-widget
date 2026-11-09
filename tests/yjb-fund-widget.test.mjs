@@ -106,7 +106,74 @@ async function testStorageFailureDoesNotHideData() {
   assert(!values.some((value) => value.includes('更新失败')));
 }
 
+async function testSourceCircuitBreakerAndBatchFallback() {
+  const holdings = Array.from({ length: 5 }, (_, index) => ({
+    fund_id: 301 + index,
+    short_name: `持仓基金${index + 1}`,
+    money: 1000,
+  }));
+  let rateCalls = 0;
+  let estimateCalls = 0;
+  const ctx = {
+    env: { YJB_TOKEN: 'test', YJB_SIGNING_SECRET: 'test' },
+    widgetFamily: 'systemLarge',
+    storage: storage(),
+    http: {
+      get: async (url) => {
+        if (url.includes('/users/v1/user-account')) return response({ list: [{ id: 1 }] });
+        if (url.includes('/fund-accounts/')) return response({ list: holdings });
+        if (url.includes('/increase-rate')) {
+          rateCalls += 1;
+          return response({});
+        }
+        if (url.includes('/gz-data')) {
+          estimateCalls += 1;
+          return response({ weighted_increase_rate: -0.7, market_status: 'open' });
+        }
+        throw new Error(url);
+      },
+      post: async (url) => {
+        if (url.includes('/market/v1/fund/batch')) throw new Error('metadata source unavailable');
+        throw new Error(url);
+      },
+    },
+  };
+  const values = textNodes(await widget(ctx)).map((node) => String(node.text));
+  assert.equal(estimateCalls, holdings.length, 'estimate fallback should cover every holding');
+  assert(rateCalls < holdings.length * 2, `source circuit breaker did not reduce probes: ${rateCalls}`);
+  assert(holdings.every((holding) => values.some((value) => value.includes(holding.short_name))), 'holding names must survive metadata failure');
+  assert(values.filter((value) => value.includes('当日涨幅')).length >= holdings.length);
+}
+
+async function testAmountOnlyPrimarySource() {
+  let estimateCalls = 0;
+  const ctx = {
+    env: { YJB_TOKEN: 'test', YJB_SIGNING_SECRET: 'test' },
+    widgetFamily: 'systemLarge',
+    storage: storage(),
+    http: {
+      get: async (url) => {
+        if (url.includes('/users/v1/user-account')) return response({ list: [{ id: 1 }] });
+        if (url.includes('/fund-accounts/')) return response({ list: [{ fund_id: 401, money: 1000, short_name: '金额源基金' }] });
+        if (url.includes('/increase-rate')) return response({ increase_amount: 7, market_status: 'open' });
+        if (url.includes('/gz-data')) {
+          estimateCalls += 1;
+          return response({});
+        }
+        throw new Error(url);
+      },
+      post: async () => response([]),
+    },
+  };
+  const values = textNodes(await widget(ctx)).map((node) => String(node.text));
+  assert(values.some((value) => value.includes('当日涨幅金额 +7.00')));
+  assert(values.some((value) => value.includes('开市 · 实时')));
+  assert.equal(estimateCalls, 0, 'amount-only primary quote should not trigger fallbacks');
+}
+
 await testFamilies();
 await testClosedStateAndFallbackParsing();
 await testStorageFailureDoesNotHideData();
+await testSourceCircuitBreakerAndBatchFallback();
+await testAmountOnlyPrimarySource();
 console.log('PASS: widget families, closed-state semantics, response wrappers, and storage-failure isolation');

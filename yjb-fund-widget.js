@@ -762,12 +762,17 @@ function hasDailyAmount(quote = {}) {
   ) !== null;
 }
 
+function hasUsableQuote(quote = {}) {
+  return hasDailyRate(quote) || hasDailyAmount(quote);
+}
+
 async function requestQuoteWithRetry(ctx, options, attempts = QUOTE_ATTEMPTS, requireRate = false) {
   let result = {};
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     result = await requestQuote(ctx, options);
-    const complete = requireRate ? hasDailyRate(result) : hasDailyRate(result) || hasDailyAmount(result);
-    if (complete) return result;
+    const complete = requireRate ? hasDailyRate(result) : hasUsableQuote(result);
+    const usableAmount = requireRate && hasDailyAmount(result);
+    if (complete || usableAmount) return result;
     if (attempt + 1 < attempts) {
       await new Promise((resolve) => setTimeout(resolve, QUOTE_RETRY_DELAY_MS * (attempt + 1)));
     }
@@ -843,37 +848,78 @@ async function mapWithConcurrency(items, limit, worker) {
   return results;
 }
 
+function createQuoteSourceHealth() {
+  return {
+    misses: new Map(),
+    pending: new Map(),
+    disabled: new Set(),
+  };
+}
+
+async function requestQuoteSource(health, sourceKey, runner) {
+  if (health.disabled.has(sourceKey)) return {};
+  const misses = health.misses.get(sourceKey) || 0;
+  const pending = health.pending.get(sourceKey) || 0;
+  if (misses + pending >= 3) {
+    health.disabled.add(sourceKey);
+    return {};
+  }
+  health.pending.set(sourceKey, pending + 1);
+  let result = {};
+  try {
+    result = await runner();
+  } finally {
+    const remaining = (health.pending.get(sourceKey) || 1) - 1;
+    if (remaining > 0) health.pending.set(sourceKey, remaining);
+    else health.pending.delete(sourceKey);
+  }
+  if (hasUsableQuote(result)) {
+    health.misses.delete(sourceKey);
+    health.disabled.delete(sourceKey);
+    return result;
+  }
+  const totalMisses = (health.misses.get(sourceKey) || 0) + 1;
+  health.misses.set(sourceKey, totalMisses);
+  // A source that misses several consecutive funds is probably unavailable.
+  // Stop probing it for the rest of this refresh and move to the next source.
+  if (totalMisses >= 3) health.disabled.add(sourceKey);
+  return {};
+}
+
 async function fetchNewQuotes(ctx, { base, token, secret, policy, fundIds }) {
   const uniqueFundIds = [...new Set(fundIds.map((id) => String(id)))];
+  const sourceHealth = createQuoteSourceHealth();
   const pairs = await mapWithConcurrency(uniqueFundIds, QUOTE_CONCURRENCY, async (fundId) => {
     // The rate endpoint is the lightest endpoint and contains the fields needed by
     // the widget. Query it first so a slow valuation endpoint cannot starve later funds.
-    const rate = await requestQuoteWithRetry(ctx, {
+    const rate = await requestQuoteSource(sourceHealth, 'increase-rate', () => requestQuoteWithRetry(ctx, {
       base,
       path: `/market/v1/fund/increase-rate?fund_id=${encodeURIComponent(fundId)}`,
       token, secret, api: 'new', policy,
-    }, QUOTE_ATTEMPTS, true);
-    if (hasDailyRate(rate)) return [fundId, { ...rate, _quoteSource: 'realtime' }];
+    }, QUOTE_ATTEMPTS, true));
+    if (hasUsableQuote(rate)) return [fundId, { ...rate, _quoteSource: 'realtime' }];
 
-    const estimate = await requestQuoteWithRetry(ctx, {
+    const estimate = await requestQuoteSource(sourceHealth, 'gz-data', () => requestQuoteWithRetry(ctx, {
       base,
       path: `/market/v1/fund/gz-data?fund_id=${encodeURIComponent(fundId)}&source=1`,
       token, secret, api: 'new', policy,
-    }, 1);
+    }, 1));
     let merged = { ...estimate, ...rate };
-    if (!hasDailyRate(merged)) {
-      const overview = await requestQuote(ctx, {
+    if (!hasUsableQuote(merged)) {
+      const overview = await requestQuoteSource(sourceHealth, 'overview', () => requestQuote(ctx, {
         base,
         path: `/market/v1/fund/overview?data_source=1&fund_id=${encodeURIComponent(fundId)}`,
         token, secret, api: 'new', policy,
-      });
+      }));
       merged = { ...overview, ...merged, _quoteSource: 'overview' };
     }
-    if (!hasDailyRate(merged)) {
-      const history = await fetchHistoryQuote(ctx, { base, token, secret, policy, fundId });
+    if (!hasUsableQuote(merged)) {
+      const history = await requestQuoteSource(sourceHealth, 'history', () => fetchHistoryQuote(ctx, {
+        base, token, secret, policy, fundId,
+      }));
       merged = { ...history, ...merged, _quoteSource: 'history' };
     }
-    if (!merged._quoteSource && hasDailyRate(merged)) merged._quoteSource = 'estimate';
+    if (!merged._quoteSource && hasUsableQuote(merged)) merged._quoteSource = 'estimate';
     return [fundId, merged];
   });
   return new Map(pairs);
@@ -905,18 +951,25 @@ async function fetchNew(ctx, env) {
     .map(fundIdOf)
     .filter((id) => id !== undefined && id !== null)
     .map((id) => String(id)))];
-  const fundInfo = fundIds.length
-    ? readList(await request(ctx, {
-      base,
-      path: '/market/v1/fund/batch',
-      token,
-      secret,
-      api: 'new',
-      policy,
-      method: 'POST',
-      body: { funds: fundIds.map((fund_id) => ({ fund_id, data_source: '1' })) },
-    }))
-    : [];
+  let fundInfo = [];
+  if (fundIds.length) {
+    try {
+      fundInfo = readList(await request(ctx, {
+        base,
+        path: '/market/v1/fund/batch',
+        token,
+        secret,
+        api: 'new',
+        policy,
+        method: 'POST',
+        body: { funds: fundIds.map((fund_id) => ({ fund_id, data_source: '1' })) },
+      }));
+    } catch (_) {
+      // Fund metadata is supplemental. Keep holdings and let quote fallbacks
+      // populate the values when the batch endpoint is unavailable.
+      fundInfo = [];
+    }
+  }
   const explicitStatus = explicitStatusFromRecords([...holdings, ...fundInfo]);
   const quoteById = fundIds.length && explicitStatus !== '休市'
     ? await fetchNewQuotes(ctx, { base, token, secret, policy, fundIds })
@@ -956,12 +1009,14 @@ async function fetchOld(ctx, env) {
         : null;
     const explicitStatus = explicitMarketStatus(nav.market_status, nav.marketStatus, nav.status, nav.is_open);
     const quoteAt = parseTimestamp(pickText(nav.gztime, nav.vgsztime, nav.zsgztime, nav.update_time, nav.updated_at));
+    const sourceIsLive = dailyChangePct !== null || dailyChangeAmount !== null;
+    const fresh = quoteIsFresh(quoteAt);
     return {
       name: String(holding.short_name || holding.name || holding.code || '基金'),
       dailyChangeAmount,
       dailyChangePct,
-      dailyChangeIsLive: true,
-      dailyChangeSource: 'realtime',
+      dailyChangeIsLive: sourceIsLive && fresh,
+      dailyChangeSource: sourceIsLive && !fresh ? 'stale' : 'realtime',
       marketStatus: explicitStatus || (isTradingWindow() ? '开市' : '休市'),
       marketStatusExplicit: explicitStatus !== null,
       quoteAt: quoteAt ? quoteAt.toISOString() : null,
