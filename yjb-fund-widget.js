@@ -190,6 +190,7 @@ function normalizeRows(holdings, fundInfo, quoteById = new Map()) {
     const id = fundIdOf(holding);
     const info = infoById.get(String(id)) || {};
     const quote = quoteById.get(String(id)) || {};
+    const quoteSource = quote._quoteSource || 'unknown';
     const liveDailyPct = pickNumber(
       quote.gszzl, quote.vgszzl, quote.zsgzzl, quote.increase_rate, quote.increaseRate,
       quote.day_growth_rate, quote.dayGrowthRate, quote.change_percent, quote.changePercent,
@@ -269,7 +270,9 @@ function normalizeRows(holdings, fundInfo, quoteById = new Map()) {
       lastNav,
       dailyChangeAmount,
       dailyChangePct,
-      dailyChangeIsLive: liveDailyPct !== null || quoteDailyChangeAmount !== null,
+      dailyChangeIsLive: (quoteSource === 'realtime' || quoteSource === 'estimate')
+        && (liveDailyPct !== null || quoteDailyChangeAmount !== null),
+      dailyChangeSource: quoteSource,
       marketStatus: normalizeMarketStatus(quote.market_status, quote.marketStatus, quote.status, quote.is_open),
       marketStatusExplicit: explicitMarketStatus(quote.market_status, quote.marketStatus, quote.status, quote.is_open) !== null,
       quoteAt: quoteAt ? quoteAt.toISOString() : null,
@@ -353,6 +356,45 @@ function resolveMarketStatus(rows) {
   return isTradingWindow() ? '开市' : '休市';
 }
 
+function liveRowCount(rows) {
+  return rows.filter((row) => row.dailyChangeIsLive === true).length;
+}
+
+function resolveDataStatus(rows, marketStatus, requestState) {
+  if (requestState === 'loading') return 'loading';
+  if (marketStatus !== '开市') return 'closed';
+  if (requestState === 'error') return 'error';
+  if (!rows.length) return 'empty';
+  const liveCount = liveRowCount(rows);
+  if (liveCount === rows.length) return 'live';
+  if (liveCount > 0) return 'partial';
+  return 'delayed';
+}
+
+function statusLabelFor(marketStatus, dataStatus) {
+  if (dataStatus === 'loading') return '加载中';
+  if (dataStatus === 'error') return marketStatus === '开市' ? '开市 · 更新失败' : '休市 · 更新失败';
+  if (dataStatus === 'live') return '开市 · 实时';
+  if (dataStatus === 'partial') return '开市 · 部分实时';
+  if (dataStatus === 'delayed') return '开市 · 数据延迟';
+  if (dataStatus === 'empty') return marketStatus === '开市' ? '开市 · 无持仓' : '休市 · 无持仓';
+  if (dataStatus === 'closed') return '休市 · 最后成功';
+  return marketStatus === '开市' ? '开市 · 未更新' : '休市 · 未更新';
+}
+
+function freshnessText(marketStatus, dataStatus, updatedAt, rows) {
+  const time = updatedAt && updatedAt !== '--' ? updatedAt : '暂无';
+  const liveCount = liveRowCount(rows);
+  if (dataStatus === 'live') return `实时 · 更新于 ${time}`;
+  if (dataStatus === 'partial') return `部分实时 ${liveCount}/${rows.length} · 最后成功 ${time}`;
+  if (dataStatus === 'delayed') return `数据延迟 · 最后成功 ${time}`;
+  if (dataStatus === 'error') return `更新失败 · 最后成功 ${time}`;
+  if (dataStatus === 'loading') return '加载中 · 等待首次成功更新';
+  if (dataStatus === 'closed') return `休市 · 最后成功 ${time}`;
+  if (dataStatus === 'empty') return `无持仓 · 最近请求 ${time}`;
+  return `${marketStatus} · 最后成功 ${time}`;
+}
+
 function holdingRow(row, family, colors, options) {
   const narrow = family === 'systemSmall' || family === 'accessoryRectangular';
   const lockScreen = family.startsWith('accessory');
@@ -412,10 +454,18 @@ function denseHoldingRow(row, colors, options) {
   };
 }
 
-function makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family, options) {
+function makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family, options, dataStatus = null) {
   const compact = family === 'systemSmall' || family === 'accessoryRectangular';
   const lockScreen = family.startsWith('accessory');
-  const statusLabel = marketStatus === '开市' ? '开市' : '休市（最后有效）';
+  const resolvedDataStatus = dataStatus || resolveDataStatus(rows, marketStatus, state === '加载中' ? 'loading' : state === '实时' ? 'success' : 'error');
+  const statusLabel = statusLabelFor(marketStatus, resolvedDataStatus);
+  const statusColor = resolvedDataStatus === 'live'
+    ? '#43C89A'
+    : resolvedDataStatus === 'partial'
+      ? '#FFB84D'
+      : resolvedDataStatus === 'error'
+        ? '#FF6B5F'
+        : '#A9AAB5';
   const denseLayout = !lockScreen && (
     family === 'systemLarge'
     || family === 'systemExtraLarge'
@@ -446,7 +496,7 @@ function makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family
       children: [
         text('养基宝', lockScreen ? 'caption1' : compact ? 'headline' : 'title3', 'bold', colors.primary),
         { type: 'spacer' },
-        text(statusLabel, 'caption2', 'medium', marketStatus === '开市' ? colors.positive : colors.secondary, 1),
+        text(statusLabel, 'caption2', 'medium', statusColor, 1),
       ],
     },
   ];
@@ -469,7 +519,7 @@ function makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family
 
   if (!lockScreen) {
     children.push({ type: 'spacer' });
-    children.push(text(`字段上限 ${options.maxFields} · ${marketStatus === '开市' ? '涨幅更新' : '最后有效涨幅'} ${updatedAt}`, 'caption2', 'regular', colors.secondary, 1));
+    children.push(text(`字段上限 ${options.maxFields} · ${freshnessText(marketStatus, resolvedDataStatus, updatedAt, rows)}`, 'caption2', 'regular', colors.secondary, 1));
   }
   return {
     type: 'widget',
@@ -699,7 +749,7 @@ async function fetchNewQuotes(ctx, { base, token, secret, policy, fundIds }) {
       path: `/market/v1/fund/increase-rate?fund_id=${encodeURIComponent(fundId)}`,
       token, secret, api: 'new', policy,
     }, QUOTE_ATTEMPTS, true);
-    if (hasDailyRate(rate)) return [fundId, rate];
+    if (hasDailyRate(rate)) return [fundId, { ...rate, _quoteSource: 'realtime' }];
 
     const estimate = await requestQuoteWithRetry(ctx, {
       base,
@@ -713,12 +763,13 @@ async function fetchNewQuotes(ctx, { base, token, secret, policy, fundIds }) {
         path: `/market/v1/fund/overview?data_source=1&fund_id=${encodeURIComponent(fundId)}`,
         token, secret, api: 'new', policy,
       });
-      merged = { ...overview, ...merged };
+      merged = { ...overview, ...merged, _quoteSource: 'overview' };
     }
     if (!hasDailyRate(merged)) {
       const history = await fetchHistoryQuote(ctx, { base, token, secret, policy, fundId });
-      merged = { ...history, ...merged };
+      merged = { ...history, ...merged, _quoteSource: 'history' };
     }
+    if (!merged._quoteSource && hasDailyRate(merged)) merged._quoteSource = 'estimate';
     return [fundId, merged];
   });
   return new Map(pairs);
@@ -802,6 +853,7 @@ async function fetchOld(ctx, env) {
       dailyChangeAmount,
       dailyChangePct,
       dailyChangeIsLive: true,
+      dailyChangeSource: 'realtime',
       marketStatus: explicitStatus || (isTradingWindow() ? '开市' : '休市'),
       marketStatusExplicit: explicitStatus !== null,
       quoteAt: quoteAt ? quoteAt.toISOString() : null,
@@ -820,6 +872,7 @@ export default async function (ctx) {
   let updatedAt = '--';
   let marketStatus = isTradingWindow() ? '开市' : '休市';
   let refreshSeconds = marketStatus === '开市' ? OPEN_REFRESH_SECONDS : CLOSED_REFRESH_SECONDS;
+  let dataStatus = 'loading';
   let cache;
 
   try {
@@ -837,31 +890,35 @@ export default async function (ctx) {
       if (cache && Array.isArray(cache.rows) && Date.now() - cache.savedAt < CACHE_TTL_SECONDS * 1000) {
         const cachedRows = normalizeCachedRows(cache.rows);
         const cachedStatus = cache.marketStatus || resolveMarketStatus(cachedRows);
-        return makeWidget(cachedRows, cache.updatedAt || '--', '缓存', cachedStatus, cachedStatus === '开市' ? OPEN_REFRESH_SECONDS : ERROR_REFRESH_SECONDS, family, options);
+        const cachedUpdatedAt = cache.updatedAt || (cache.lastSuccessAt ? localTime(new Date(cache.lastSuccessAt)) : '--');
+        return makeWidget(cachedRows, cachedUpdatedAt, '缓存', cachedStatus, cachedStatus === '开市' ? OPEN_REFRESH_SECONDS : ERROR_REFRESH_SECONDS, family, options, resolveDataStatus(cachedRows, cachedStatus, 'error'));
       }
-      return makeWidget([], '--', '加载中', marketStatus, ERROR_REFRESH_SECONDS, family, options);
+      return makeWidget([], '--', '加载中', marketStatus, ERROR_REFRESH_SECONDS, family, options, 'loading');
     }
     if (!outcome.ok) throw outcome.error;
     const fetched = outcome.value;
     const fetchedRows = Array.isArray(fetched) ? fetched : fetched.rows || [];
     rows = mergeCachedRows(fetchedRows, cache && cache.rows);
     marketStatus = Array.isArray(fetched) ? resolveMarketStatus(rows) : fetched.marketStatus || resolveMarketStatus(rows);
-    const latest = latestQuoteTime(rows);
-    updatedAt = localTime(latest || new Date());
+    const lastSuccessAt = Date.now();
+    updatedAt = localTime(new Date(lastSuccessAt));
     state = '实时';
+    dataStatus = resolveDataStatus(rows, marketStatus, 'success');
     refreshSeconds = marketStatus === '开市' ? OPEN_REFRESH_SECONDS : CLOSED_REFRESH_SECONDS;
-    await ctx.storage.setJSON(CACHE_KEY, { rows, marketStatus, updatedAt, savedAt: Date.now() });
+    await ctx.storage.setJSON(CACHE_KEY, { rows, marketStatus, updatedAt, lastSuccessAt, savedAt: lastSuccessAt });
   } catch (error) {
     if (cache && Array.isArray(cache.rows) && Date.now() - cache.savedAt < CACHE_TTL_SECONDS * 1000) {
       rows = normalizeCachedRows(cache.rows);
-      updatedAt = cache.updatedAt || '--';
+      updatedAt = cache.updatedAt || (cache.lastSuccessAt ? localTime(new Date(cache.lastSuccessAt)) : '--');
       marketStatus = cache.marketStatus || resolveMarketStatus(rows);
       state = `缓存 · ${String(error.message || '请求失败').slice(0, 22)}`;
+      dataStatus = resolveDataStatus(rows, marketStatus, 'error');
     } else {
       state = String(error.message || '请求失败').slice(0, 28);
+      dataStatus = resolveDataStatus(rows, marketStatus, 'error');
     }
     refreshSeconds = marketStatus === '开市' ? OPEN_REFRESH_SECONDS : ERROR_REFRESH_SECONDS;
   }
 
-  return makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family, options);
+  return makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family, options, dataStatus);
 }
