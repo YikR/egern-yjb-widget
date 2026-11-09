@@ -8,7 +8,7 @@
 
 - 名称：`养基宝基金持仓`（可选）
 - 文件位置：远程
-- URL：`https://raw.githubusercontent.com/YikR/egern-yjb-widget/main/egern-yjb-widget-module.yaml?v=20261109-2`
+- URL：`https://raw.githubusercontent.com/YikR/egern-yjb-widget/main/egern-yjb-widget-module.yaml?v=20261109-3`
 - 更新间隔：留空使用 Egern 默认的 86400 秒，或自行设置
 - 启用：打开
 
