@@ -621,6 +621,58 @@ async function requestQuoteWithRetry(ctx, options, attempts = QUOTE_ATTEMPTS, re
   return result;
 }
 
+function historyTimestamp(item) {
+  return parseTimestamp(pickText(
+    item.date, item.nav_date, item.navDate, item.trade_date, item.tradeDate,
+    item.gztime, item.update_time, item.updated_at, item.timestamp, item.sjrq,
+  ));
+}
+
+function historyNav(item) {
+  return pickNumber(
+    item.nav, item.unit_nav, item.unit_net, item.unitNetValue, item.net_value,
+    item.netValue, item.dwjz, item.latest_nav, item.latestNav, item.value,
+  );
+}
+
+async function fetchHistoryQuote(ctx, { base, token, secret, policy, fundId }) {
+  try {
+    const data = await request(ctx, {
+      base,
+      path: `/market/v1/fund-nav/fund-history-nav?fund_id=${encodeURIComponent(fundId)}`,
+      token, secret, api: 'new', policy,
+    });
+    const history = readList(data)
+      .filter((item) => item && typeof item === 'object')
+      .sort((a, b) => {
+        const at = historyTimestamp(a)?.getTime() || 0;
+        const bt = historyTimestamp(b)?.getTime() || 0;
+        return bt - at;
+      });
+    if (!history.length) return {};
+    const current = history[0];
+    const previous = history.slice(1).find((item) => historyNav(item) !== null);
+    const currentNav = historyNav(current);
+    const previousNav = previous ? historyNav(previous) : null;
+    const dailyRate = hasDailyRate(current)
+      ? current
+      : currentNav !== null && previousNav !== null && previousNav !== 0
+        ? { ...current, day_growth_rate: (currentNav - previousNav) / previousNav * 100 }
+        : current;
+    return {
+      ...dailyRate,
+      nav: currentNav,
+      last_nav: previousNav,
+      update_time: pickText(
+        current.update_time, current.updated_at, current.timestamp,
+        current.date, current.nav_date, current.trade_date,
+      ),
+    };
+  } catch (_) {
+    return {};
+  }
+}
+
 async function mapWithConcurrency(items, limit, worker) {
   const results = new Array(items.length);
   let nextIndex = 0;
@@ -654,7 +706,20 @@ async function fetchNewQuotes(ctx, { base, token, secret, policy, fundIds }) {
       path: `/market/v1/fund/gz-data?fund_id=${encodeURIComponent(fundId)}&source=1`,
       token, secret, api: 'new', policy,
     }, 1);
-    return [fundId, { ...estimate, ...rate }];
+    let merged = { ...estimate, ...rate };
+    if (!hasDailyRate(merged)) {
+      const overview = await requestQuote(ctx, {
+        base,
+        path: `/market/v1/fund/overview?data_source=1&fund_id=${encodeURIComponent(fundId)}`,
+        token, secret, api: 'new', policy,
+      });
+      merged = { ...overview, ...merged };
+    }
+    if (!hasDailyRate(merged)) {
+      const history = await fetchHistoryQuote(ctx, { base, token, secret, policy, fundId });
+      merged = { ...history, ...merged };
+    }
+    return [fundId, merged];
   });
   return new Map(pairs);
 }
