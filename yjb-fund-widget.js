@@ -318,6 +318,7 @@ function normalizeCachedRows(rows) {
     dailyChangeAmount: row.dailyChangeAmount ?? row.estimateAmount ?? null,
     dailyChangePct: row.dailyChangePct ?? row.estimatePct ?? null,
     dailyChangeIsLive: row.dailyChangeIsLive ?? row.estimateIsLive ?? false,
+    dailyChangeSource: row.dailyChangeSource || (row.dailyChangeIsLive ? 'realtime' : 'cache'),
   }));
 }
 
@@ -342,6 +343,7 @@ function mergeCachedRows(rows, cachedRows) {
       dailyChangeAmount: cachedDailyChangeAmount ?? row.dailyChangeAmount,
       dailyChangePct: cachedDailyChangePct ?? row.dailyChangePct,
       dailyChangeIsLive: false,
+      dailyChangeSource: cached.dailyChangeSource || 'cache',
       estimateNav: cachedEstimateNav ?? row.estimateNav,
       lastNav: cachedLastNav ?? row.lastNav,
       quoteAt: cached.quoteAt || row.quoteAt,
@@ -395,13 +397,55 @@ function freshnessText(marketStatus, dataStatus, updatedAt, rows) {
   return `${marketStatus} · 最后成功 ${time}`;
 }
 
+function statusDotColor(row) {
+  if (row.dailyChangeIsLive === true) return '#43C89A';
+  const hasValue = [row.dailyChangeAmount, row.dailyChangePct, row.estimateNav, row.lastNav]
+    .some((value) => value !== null && value !== undefined && value !== '');
+  return hasValue ? '#FF5B5B' : '#A9AAB5';
+}
+
+function fundNameNode(row, size, weight, colors, maxLines = 1, minScale = 0.7) {
+  const name = text(row.name, size, weight, colors.primary, maxLines, minScale);
+  name.flex = 1;
+  return {
+    type: 'stack',
+    direction: 'row',
+    alignItems: 'center',
+    gap: 2,
+    children: [
+      text('●', 'caption2', 'bold', statusDotColor(row), 1, 1),
+      name,
+    ],
+  };
+}
+
+function aggregateDailyAmount(rows) {
+  const values = rows
+    .map((row) => Number(row.dailyChangeAmount))
+    .filter((value) => Number.isFinite(value));
+  return values.length ? values.reduce((sum, value) => sum + value, 0) : null;
+}
+
+function headerAmountNode(rows, dataStatus, colors) {
+  const sourceRows = dataStatus === 'partial'
+    ? rows.filter((row) => row.dailyChangeIsLive === true)
+    : rows;
+  const amount = aggregateDailyAmount(sourceRows);
+  if (amount === null) return null;
+  const live = dataStatus === 'live';
+  const partial = dataStatus === 'partial';
+  const label = live ? '当日涨幅金额' : partial ? '实时涨幅金额' : '最后有效涨幅金额';
+  const color = live || partial ? colorFor(amount, colors) : colors.secondary;
+  return text(`${label} ${formatNumber(amount)}`, 'caption1', 'medium', color, 1, 0.45);
+}
+
 function holdingRow(row, family, colors, options) {
   const narrow = family === 'systemSmall' || family === 'accessoryRectangular';
   const lockScreen = family.startsWith('accessory');
   const result = dailyChangeValue(row, narrow || lockScreen, colors, options);
 
   if (family === 'accessoryInline') {
-    return text(`${row.name} ${result.fields.length ? result.fields.map((field) => field.text).join(' / ') : result.dailyChange}`, 'caption2', 'medium', colors.primary, 1);
+    return text(`● ${row.name} ${result.fields.length ? result.fields.map((field) => field.text).join(' / ') : result.dailyChange}`, 'caption2', 'medium', statusDotColor(row), 1);
   }
   if (family === 'accessoryCircular') {
     return text(result.fields.length ? result.fields.map((field) => field.text).join('\n') : result.dailyChange, 'caption2', 'semibold', result.dailyChangeColor, 2);
@@ -416,7 +460,7 @@ function holdingRow(row, family, colors, options) {
       alignItems: 'start',
       gap: 1,
       children: [
-        text(row.name, 'caption1', 'medium', colors.primary, 1),
+        fundNameNode(row, 'caption1', 'medium', colors, 1, 0.6),
         ...fieldNodes,
       ],
     };
@@ -431,7 +475,7 @@ function holdingRow(row, family, colors, options) {
     alignItems: 'start',
     gap: 1,
     children: [
-      text(row.name, 'subheadline', 'medium', colors.primary, 1),
+      fundNameNode(row, 'subheadline', 'medium', colors, 1, 0.6),
       ...fieldNodes,
     ],
   };
@@ -440,7 +484,7 @@ function holdingRow(row, family, colors, options) {
 function denseHoldingRow(row, colors, options) {
   const result = dailyChangeValue(row, true, colors, options);
   const detail = result.fields.length ? result.fields.map((field) => field.text).join(' · ') : result.dailyChange;
-  const name = text(row.name, 'caption2', 'medium', colors.primary, 1, 0.45);
+  const name = fundNameNode(row, 'caption2', 'medium', colors, 1, 0.45);
   name.flex = 1;
   return {
     type: 'stack',
@@ -488,16 +532,19 @@ function makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family
     };
   }
 
+  const headerAmount = headerAmountNode(rows, resolvedDataStatus, colors);
+  const headerChildren = [
+    text('养基宝', lockScreen ? 'caption1' : compact ? 'headline' : 'title3', 'bold', colors.primary),
+  ];
+  if (headerAmount) headerChildren.push({ type: 'spacer' }, headerAmount);
+  headerChildren.push({ type: 'spacer' }, text(statusLabel, 'caption2', 'medium', statusColor, 1));
+
   const children = [
     {
       type: 'stack',
       direction: 'row',
       alignItems: 'center',
-      children: [
-        text('养基宝', lockScreen ? 'caption1' : compact ? 'headline' : 'title3', 'bold', colors.primary),
-        { type: 'spacer' },
-        text(statusLabel, 'caption2', 'medium', statusColor, 1),
-      ],
+      children: headerChildren,
     },
   ];
 
@@ -519,7 +566,7 @@ function makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family
 
   if (!lockScreen) {
     children.push({ type: 'spacer' });
-    children.push(text(`字段上限 ${options.maxFields} · ${freshnessText(marketStatus, resolvedDataStatus, updatedAt, rows)}`, 'caption2', 'regular', colors.secondary, 1));
+    children.push(text(freshnessText(marketStatus, resolvedDataStatus, updatedAt, rows), 'caption2', 'regular', colors.secondary, 1));
   }
   return {
     type: 'widget',
