@@ -9,6 +9,7 @@ const QUOTE_ATTEMPTS = 2;
 const QUOTE_RETRY_DELAY_MS = 180;
 const HTTP_TIMEOUT_MS = 6000;
 const FETCH_DEADLINE_MS = 16000;
+const QUOTE_STALE_AFTER_SECONDS = 10 * 60;
 
 function text(value, size, weight, color, maxLines = 1, minScale = 0.7) {
   return {
@@ -66,12 +67,15 @@ function readList(value) {
   if (data && Array.isArray(data.items)) return data.items;
   if (data && Array.isArray(data.rows)) return data.rows;
   if (data && Array.isArray(data.fund_list)) return data.fund_list;
+  if (data && data.result && (Array.isArray(data.result) || typeof data.result === 'object')) {
+    const result = readList(data.result);
+    if (result.length) return result;
+  }
   if (data && typeof data === 'object') {
     const values = Object.values(data);
-    if (values.length
-      && values.every((item) => item && typeof item === 'object' && !Array.isArray(item))
-      && values.some((item) => fundIdOf(item) !== null)) {
-      return values;
+    const objectValues = values.filter((item) => item && typeof item === 'object' && !Array.isArray(item));
+    if (objectValues.length && objectValues.some((item) => fundIdOf(item) !== null)) {
+      return objectValues;
     }
   }
   return [];
@@ -145,15 +149,29 @@ function explicitMarketStatus(...values) {
   for (const value of values) {
     if (typeof value === 'boolean') return value ? '开市' : '休市';
     if (value === undefined || value === null) continue;
-    const normalized = String(value).toLowerCase();
-    if (/(开市|交易中|trading|open|true|1)/.test(normalized)) return '开市';
-    if (/(休市|收市|closed|close|false|0)/.test(normalized)) return '休市';
+    const normalized = String(value).trim().toLowerCase();
+    if (['开市', '交易中', 'trading', 'open', 'true', '1'].includes(normalized)
+      || /^(开市|交易中|trading|open)(?:[ _-]|$)/.test(normalized)) return '开市';
+    if (['休市', '收市', 'closed', 'close', 'false', '0'].includes(normalized)
+      || /^(休市|收市|closed|close)(?:[ _-]|$)/.test(normalized)) return '休市';
   }
   return null;
 }
 
 function normalizeMarketStatus(...values) {
   return explicitMarketStatus(...values) || (isTradingWindow() ? '开市' : '休市');
+}
+
+function quoteIsFresh(quoteAt, now = Date.now()) {
+  if (!quoteAt) return true;
+  // Outside the configured mainland trading windows, a quote from the same
+  // session is a valid last market value rather than a live quote that should
+  // be aged out. The closed-state renderer marks it red separately.
+  if (!isTradingWindow(new Date(now))) return true;
+  const timestamp = new Date(quoteAt).getTime();
+  if (!Number.isFinite(timestamp)) return true;
+  const age = now - timestamp;
+  return age < 0 || age <= QUOTE_STALE_AFTER_SECONDS * 1000;
 }
 
 function colorFor(value, colors) {
@@ -261,6 +279,9 @@ function normalizeRows(holdings, fundInfo, quoteById = new Map()) {
       quote.updated_at, quote.timestamp, quote.server_time, quote.serverTime,
       info.gztime, info.update_time, info.updated_at, info.timestamp, info.server_time,
     ));
+    const sourceIsLive = (quoteSource === 'realtime' || quoteSource === 'estimate')
+      && (liveDailyPct !== null || quoteDailyChangeAmount !== null);
+    const fresh = quoteIsFresh(quoteAt);
     return {
       name: String(info.short_name || info.name || info.fund_name || info.fundName
         || holding.short_name || holding.name || holding.fund_name || holding.fundName || id || '基金'),
@@ -270,9 +291,8 @@ function normalizeRows(holdings, fundInfo, quoteById = new Map()) {
       lastNav,
       dailyChangeAmount,
       dailyChangePct,
-      dailyChangeIsLive: (quoteSource === 'realtime' || quoteSource === 'estimate')
-        && (liveDailyPct !== null || quoteDailyChangeAmount !== null),
-      dailyChangeSource: quoteSource,
+      dailyChangeIsLive: sourceIsLive && fresh,
+      dailyChangeSource: sourceIsLive && !fresh ? 'stale' : quoteSource,
       marketStatus: normalizeMarketStatus(quote.market_status, quote.marketStatus, quote.status, quote.is_open),
       marketStatusExplicit: explicitMarketStatus(quote.market_status, quote.marketStatus, quote.status, quote.is_open) !== null,
       quoteAt: quoteAt ? quoteAt.toISOString() : null,
@@ -309,6 +329,14 @@ function latestQuoteTime(rows) {
     const time = row.quoteAt ? new Date(row.quoteAt) : null;
     return time && !Number.isNaN(time.getTime()) && (!latest || time > latest) ? time : latest;
   }, null);
+}
+
+function displayUpdateTime(updatedAt, rows, dataStatus) {
+  if (dataStatus === 'live' || dataStatus === 'partial') {
+    const quoteTime = latestQuoteTime(rows);
+    if (quoteTime) return localTime(quoteTime);
+  }
+  return updatedAt;
 }
 
 function normalizeCachedRows(rows) {
@@ -358,6 +386,24 @@ function resolveMarketStatus(rows) {
   return isTradingWindow() ? '开市' : '休市';
 }
 
+function explicitStatusFromRecords(records) {
+  const statuses = records
+    .flatMap((record) => {
+      if (!record || typeof record !== 'object') return [];
+      return [explicitMarketStatus(
+        record.market_status,
+        record.marketStatus,
+        record.status,
+        record.is_open,
+        record.isOpen,
+      )];
+    })
+    .filter(Boolean);
+  if (statuses.includes('开市')) return '开市';
+  if (statuses.includes('休市')) return '休市';
+  return null;
+}
+
 function liveRowCount(rows) {
   return rows.filter((row) => row.dailyChangeIsLive === true).length;
 }
@@ -397,14 +443,14 @@ function freshnessText(marketStatus, dataStatus, updatedAt, rows) {
   return `${marketStatus} · 最后成功 ${time}`;
 }
 
-function statusDotColor(row) {
-  if (row.dailyChangeIsLive === true) return '#43C89A';
+function statusDotColor(row, liveWindow = true) {
+  if (liveWindow && row.dailyChangeIsLive === true) return '#43C89A';
   const hasValue = [row.dailyChangeAmount, row.dailyChangePct, row.estimateNav, row.lastNav]
     .some((value) => value !== null && value !== undefined && value !== '');
   return hasValue ? '#FF5B5B' : '#A9AAB5';
 }
 
-function fundNameNode(row, size, weight, colors, maxLines = 1, minScale = 0.7) {
+function fundNameNode(row, size, weight, colors, maxLines = 1, minScale = 0.7, liveWindow = true) {
   const name = text(row.name, size, weight, colors.primary, maxLines, minScale);
   name.flex = 1;
   return {
@@ -413,7 +459,7 @@ function fundNameNode(row, size, weight, colors, maxLines = 1, minScale = 0.7) {
     alignItems: 'center',
     gap: 2,
     children: [
-      text('●', 'caption2', 'bold', statusDotColor(row), 1, 1),
+      text('●', 'caption2', 'bold', statusDotColor(row, liveWindow), 1, 1),
       name,
     ],
   };
@@ -439,13 +485,13 @@ function headerAmountNode(rows, dataStatus, colors) {
   return text(`${label} ${formatNumber(amount)}`, 'caption1', 'medium', color, 1, 0.45);
 }
 
-function holdingRow(row, family, colors, options) {
+function holdingRow(row, family, colors, options, liveWindow = true) {
   const narrow = family === 'systemSmall' || family === 'accessoryRectangular';
   const lockScreen = family.startsWith('accessory');
   const result = dailyChangeValue(row, narrow || lockScreen, colors, options);
 
   if (family === 'accessoryInline') {
-    return text(`● ${row.name} ${result.fields.length ? result.fields.map((field) => field.text).join(' / ') : result.dailyChange}`, 'caption2', 'medium', statusDotColor(row), 1);
+    return text(`● ${row.name} ${result.fields.length ? result.fields.map((field) => field.text).join(' / ') : result.dailyChange}`, 'caption2', 'medium', statusDotColor(row, liveWindow), 1);
   }
   if (family === 'accessoryCircular') {
     return text(result.fields.length ? result.fields.map((field) => field.text).join('\n') : result.dailyChange, 'caption2', 'semibold', result.dailyChangeColor, 2);
@@ -460,7 +506,7 @@ function holdingRow(row, family, colors, options) {
       alignItems: 'start',
       gap: 1,
       children: [
-        fundNameNode(row, 'caption1', 'medium', colors, 1, 0.6),
+        fundNameNode(row, 'caption1', 'medium', colors, 1, 0.6, liveWindow),
         ...fieldNodes,
       ],
     };
@@ -475,16 +521,16 @@ function holdingRow(row, family, colors, options) {
     alignItems: 'start',
     gap: 1,
     children: [
-      fundNameNode(row, 'subheadline', 'medium', colors, 1, 0.6),
+      fundNameNode(row, 'subheadline', 'medium', colors, 1, 0.6, liveWindow),
       ...fieldNodes,
     ],
   };
 }
 
-function denseHoldingRow(row, colors, options) {
+function denseHoldingRow(row, colors, options, liveWindow = true) {
   const result = dailyChangeValue(row, true, colors, options);
   const detail = result.fields.length ? result.fields.map((field) => field.text).join(' · ') : result.dailyChange;
-  const name = fundNameNode(row, 'caption2', 'medium', colors, 1, 0.45);
+  const name = fundNameNode(row, 'caption2', 'medium', colors, 1, 0.45, liveWindow);
   name.flex = 1;
   return {
     type: 'stack',
@@ -499,9 +545,10 @@ function denseHoldingRow(row, colors, options) {
 }
 
 function makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family, options, dataStatus = null) {
-  const compact = family === 'systemSmall' || family === 'accessoryRectangular';
+  const compact = family === 'systemSmall' || family.startsWith('accessory');
   const lockScreen = family.startsWith('accessory');
   const resolvedDataStatus = dataStatus || resolveDataStatus(rows, marketStatus, state === '加载中' ? 'loading' : state === '实时' ? 'success' : 'error');
+  const liveWindow = marketStatus === '开市' && (resolvedDataStatus === 'live' || resolvedDataStatus === 'partial');
   const statusLabel = statusLabelFor(marketStatus, resolvedDataStatus);
   const statusColor = resolvedDataStatus === 'live'
     ? '#43C89A'
@@ -524,7 +571,7 @@ function makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family
   };
   if (family === 'accessoryInline') {
     const row = rows[0];
-    const value = row ? holdingRow(row, family, colors, options).text : state;
+    const value = row ? holdingRow(row, family, colors, options, liveWindow).text : state;
     return {
       type: 'widget',
       refreshAfter: new Date(Date.now() + refreshSeconds * 1000).toISOString(),
@@ -532,7 +579,9 @@ function makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family
     };
   }
 
-  const headerAmount = headerAmountNode(rows, resolvedDataStatus, colors);
+  const headerAmount = !compact && !lockScreen
+    ? headerAmountNode(rows, resolvedDataStatus, colors)
+    : null;
   const headerChildren = [
     text('养基宝', lockScreen ? 'caption1' : compact ? 'headline' : 'title3', 'bold', colors.primary),
   ];
@@ -557,7 +606,9 @@ function makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family
       ? rows
       : rows.slice(0, family === 'systemSmall' ? 1 : compact ? 1 : 2);
     for (const row of visible) {
-      children.push(denseLayout ? denseHoldingRow(row, colors, options) : holdingRow(row, family, colors, options));
+      children.push(denseLayout
+        ? denseHoldingRow(row, colors, options, liveWindow)
+        : holdingRow(row, family, colors, options, liveWindow));
     }
     if (!denseLayout && rows.length > visible.length) {
       children.push(text(`另有 ${rows.length - visible.length} 只`, 'caption2', 'regular', colors.secondary));
@@ -566,7 +617,13 @@ function makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family
 
   if (!lockScreen) {
     children.push({ type: 'spacer' });
-    children.push(text(freshnessText(marketStatus, resolvedDataStatus, updatedAt, rows), 'caption2', 'regular', colors.secondary, 1));
+    children.push(text(
+      freshnessText(marketStatus, resolvedDataStatus, displayUpdateTime(updatedAt, rows, resolvedDataStatus), rows),
+      'caption2',
+      'regular',
+      colors.secondary,
+      1,
+    ));
   }
   return {
     type: 'widget',
@@ -844,7 +901,10 @@ async function fetchNew(ctx, env) {
   });
   const holdings = readList(holdingsData);
   if (!holdings.length) return { rows: [], marketStatus: isTradingWindow() ? '开市' : '休市' };
-  const fundIds = holdings.map(fundIdOf).filter((id) => id !== undefined && id !== null);
+  const fundIds = [...new Set(holdings
+    .map(fundIdOf)
+    .filter((id) => id !== undefined && id !== null)
+    .map((id) => String(id)))];
   const fundInfo = fundIds.length
     ? readList(await request(ctx, {
       base,
@@ -857,7 +917,8 @@ async function fetchNew(ctx, env) {
       body: { funds: fundIds.map((fund_id) => ({ fund_id, data_source: '1' })) },
     }))
     : [];
-  const quoteById = fundIds.length
+  const explicitStatus = explicitStatusFromRecords([...holdings, ...fundInfo]);
+  const quoteById = fundIds.length && explicitStatus !== '休市'
     ? await fetchNewQuotes(ctx, { base, token, secret, policy, fundIds })
     : new Map();
   const rows = normalizeRows(holdings, fundInfo, quoteById);
@@ -909,6 +970,24 @@ async function fetchOld(ctx, env) {
   return { rows, marketStatus: resolveMarketStatus(rows) };
 }
 
+async function readCache(ctx) {
+  try {
+    const value = await ctx.storage.getJSON(CACHE_KEY);
+    return value && typeof value === 'object' ? value : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function writeCache(ctx, value) {
+  try {
+    await ctx.storage.setJSON(CACHE_KEY, value);
+  } catch (_) {
+    // Storage is an optional optimization. A write failure must not turn a
+    // successful API response into an error state.
+  }
+}
+
 export default async function (ctx) {
   const env = ctx.env || {};
   const api = env.YJB_API === 'old' ? 'old' : 'new';
@@ -923,7 +1002,7 @@ export default async function (ctx) {
   let cache;
 
   try {
-    cache = await ctx.storage.getJSON(CACHE_KEY);
+    cache = await readCache(ctx);
     const fetchPromise = (api === 'old' ? fetchOld(ctx, env) : fetchNew(ctx, env))
       .then((value) => ({ ok: true, value }))
       .catch((error) => ({ ok: false, error }));
@@ -952,7 +1031,7 @@ export default async function (ctx) {
     state = '实时';
     dataStatus = resolveDataStatus(rows, marketStatus, 'success');
     refreshSeconds = marketStatus === '开市' ? OPEN_REFRESH_SECONDS : CLOSED_REFRESH_SECONDS;
-    await ctx.storage.setJSON(CACHE_KEY, { rows, marketStatus, updatedAt, lastSuccessAt, savedAt: lastSuccessAt });
+    await writeCache(ctx, { rows, marketStatus, updatedAt, lastSuccessAt, savedAt: lastSuccessAt });
   } catch (error) {
     if (cache && Array.isArray(cache.rows) && Date.now() - cache.savedAt < CACHE_TTL_SECONDS * 1000) {
       rows = normalizeCachedRows(cache.rows);
