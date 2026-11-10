@@ -245,7 +245,7 @@ async function testQuoteSourceFailureIsVisibleWithCachedValues() {
     http: {
       get: async (url) => {
         if (url.includes('/users/v1/user-account')) return response({ list: [{ id: 1 }] });
-        if (url.includes('/fund-accounts/')) return response({ list: [{ fund_id: 501, short_name: '缓存基金', money: 1000 }] });
+        if (url.includes('/fund-accounts/')) return response({ list: [{ fund_id: 501, short_name: '缓存基金', money: 1000, market_status: 'open' }] });
         if (/increase-rate|gz-data|fund\/overview|fund-history-nav/.test(url)) {
           throw new Error('quote endpoint unavailable');
         }

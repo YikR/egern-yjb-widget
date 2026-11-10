@@ -1214,6 +1214,7 @@ export default async function (ctx) {
     const quoteRequestState = quoteDiagnostics
       && quoteDiagnostics.usable === 0
       && quoteDiagnostics.failed > 0
+      && quoteDiagnostics.empty === 0
       ? 'quote-error'
       : 'success';
     dataStatus = resolveDataStatus(rows, marketStatus, quoteRequestState);
