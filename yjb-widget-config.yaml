@@ -4,7 +4,7 @@ scriptings:
   - generic:
       name: 养基宝持仓
       script_url: ./yjb-fund-widget.js
-      timeout: 20
+      timeout: 60
 
 widgets:
   - name: 养基宝持仓

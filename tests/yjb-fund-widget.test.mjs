@@ -229,6 +229,96 @@ async function testTokenConfigurationStates() {
   assert(invalidValues.some((value) => value.includes('Token 验证失败 · 令牌无效')));
 }
 
+async function testQuoteSourceFailureIsVisibleWithCachedValues() {
+  const ctx = {
+    env: { YJB_TOKEN: 'test', YJB_SIGNING_SECRET: 'test' },
+    widgetFamily: 'systemLarge',
+    storage: storage({
+      'yjb-fund-widget-cache-v2': {
+        rows: [{
+          id: '501', name: '缓存基金', dailyChangeAmount: 9.5, dailyChangePct: 0.8,
+          dailyChangeIsLive: true, estimateNav: 1.2, lastNav: 1.1,
+        }],
+        marketStatus: '开市', updatedAt: '11/10 14:00', savedAt: Date.now(),
+      },
+    }),
+    http: {
+      get: async (url) => {
+        if (url.includes('/users/v1/user-account')) return response({ list: [{ id: 1 }] });
+        if (url.includes('/fund-accounts/')) return response({ list: [{ fund_id: 501, short_name: '缓存基金', money: 1000 }] });
+        if (/increase-rate|gz-data|fund\/overview|fund-history-nav/.test(url)) {
+          throw new Error('quote endpoint unavailable');
+        }
+        throw new Error(url);
+      },
+      post: async () => response([]),
+    },
+  };
+  const nodes = textNodes(await widget(ctx));
+  const values = nodes.map((node) => String(node.text));
+  assert(values.some((value) => value.includes('开市 · 行情源请求失败')));
+  assert(values.some((value) => value.includes('缓存基金')));
+  assert(values.some((value) => value.includes('当日涨幅金额 +9.50')));
+  const dot = nodes.find((node) => node.text === '●');
+  assert.equal(dot.textColor, '#FF5B5B', 'cached quote must not be marked live');
+}
+
+async function testOverviewNestedQuoteFallback() {
+  const dateParts = Object.fromEntries(new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(new Date()).map((part) => [part.type, part.value]));
+  const today = `${dateParts.year}-${dateParts.month}-${dateParts.day}`;
+  const makeContext = (valuationDate) => ({
+    env: { YJB_TOKEN: 'test', YJB_SIGNING_SECRET: 'test' },
+    widgetFamily: 'systemLarge',
+    storage: storage(),
+    http: {
+      get: async (url) => {
+        if (url.includes('/users/v1/user-account')) return response({ list: [{ id: 1 }] });
+        if (url.includes('/fund-accounts/')) return response({ list: [{ fund_id: 601, short_name: '嵌套估值基金', money: 1000 }] });
+        if (url.includes('/increase-rate')) return {
+          status: 200, json: async () => ({ code: 1001, message: '暂无持仓重仓股信息' }),
+        };
+        if (url.includes('/gz-data')) return response({ day: today, list: null });
+        if (url.includes('/fund/overview')) return response({
+          code: '000601', market_status: 'open', rate: null, nv_info: {
+            code: '000601',
+            vgszzl: '1.25', vgsz: '1.0125', dwjz: '1.0',
+            time: new Date().toISOString(), gztime: today, true_valuation_date: valuationDate,
+          },
+        });
+        throw new Error(url);
+      },
+      post: async () => response([]),
+    },
+  });
+  const liveNodes = textNodes(await widget(makeContext(today)));
+  const liveValues = liveNodes.map((node) => String(node.text));
+  assert(liveValues.some((value) => value.includes('开市 · 实时')));
+  assert(liveValues.some((value) => value.includes('当日涨幅 +1.25%')));
+  assert.equal(liveNodes.find((node) => node.text === '●').textColor, '#43C89A');
+
+  const staleNodes = textNodes(await widget(makeContext('2000-01-01')));
+  const staleValues = staleNodes.map((node) => String(node.text));
+  assert(staleValues.some((value) => value.includes('开市 · 数据延迟')));
+  assert.equal(staleNodes.find((node) => node.text === '●').textColor, '#FF5B5B');
+}
+
+async function testSlowQuoteCompletesBeforeFetchDeadline() {
+  const ctx = liveContext('systemLarge');
+  const originalGet = ctx.http.get;
+  ctx.http.get = async (url) => {
+    if (url.includes('/increase-rate')) {
+      await new Promise((resolve) => setTimeout(resolve, 11000));
+      return response({ weighted_increase_rate: 0.6, increase_amount: 6, market_status: 'open' });
+    }
+    return originalGet(url);
+  };
+  const values = textNodes(await widget(ctx)).map((node) => String(node.text));
+  assert(values.some((value) => value.includes('开市 · 实时')));
+  assert(values.some((value) => value.includes('当日涨幅金额 +6.00')));
+}
+
 await testFamilies();
 await testClosedStateAndFallbackParsing();
 await testClosedLatestNavUsesGreenIndicator();
@@ -236,4 +326,7 @@ await testStorageFailureDoesNotHideData();
 await testSourceCircuitBreakerAndBatchFallback();
 await testAmountOnlyPrimarySource();
 await testTokenConfigurationStates();
-console.log('PASS: widget families, token states, closed-state semantics, response wrappers, and storage-failure isolation');
+await testQuoteSourceFailureIsVisibleWithCachedValues();
+await testOverviewNestedQuoteFallback();
+await testSlowQuoteCompletesBeforeFetchDeadline();
+console.log('PASS: widget families, token and quote-source states, slow-fetch recovery, closed-state semantics, and storage isolation');

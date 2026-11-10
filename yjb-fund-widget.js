@@ -7,8 +7,8 @@ const ERROR_REFRESH_SECONDS = 5 * 60;
 const QUOTE_CONCURRENCY = 3;
 const QUOTE_ATTEMPTS = 2;
 const QUOTE_RETRY_DELAY_MS = 180;
-const HTTP_TIMEOUT_MS = 6000;
-const FETCH_DEADLINE_MS = 16000;
+const HTTP_TIMEOUT_MS = 12000;
+const FETCH_DEADLINE_MS = 55000;
 const QUOTE_STALE_AFTER_SECONDS = 10 * 60;
 
 function text(value, size, weight, color, maxLines = 1, minScale = 0.7) {
@@ -50,7 +50,8 @@ function unwrap(value) {
   let current = value;
   for (let i = 0; i < 3; i += 1) {
     if (!current || typeof current !== 'object' || Array.isArray(current)) break;
-    if (current.code !== undefined && Number(current.code) !== 200) {
+    const apiEnvelope = current.data !== undefined || current.message !== undefined || current.msg !== undefined;
+    if (apiEnvelope && current.code !== undefined && Number(current.code) !== 200) {
       const error = new Error(current.message || `API 返回错误 (${current.code})`);
       error.code = Number(current.code);
       throw error;
@@ -90,8 +91,8 @@ function readObject(value) {
   for (const key of ['list', 'items', 'rows', 'funds', 'fund_list']) {
     if (Array.isArray(data[key])) return data[key][0] && typeof data[key][0] === 'object' ? data[key][0] : {};
   }
-  for (const key of ['quote', 'fund', 'result', 'quote_data', 'fund_data', 'gz_data']) {
-    if (data[key] && typeof data[key] === 'object') return readObject(data[key]);
+  for (const key of ['quote', 'fund', 'result', 'quote_data', 'fund_data', 'gz_data', 'nv_info']) {
+    if (data[key] && typeof data[key] === 'object') return { ...data, ...readObject(data[key]) };
   }
   return data;
 }
@@ -215,6 +216,16 @@ function quoteIsFresh(quoteAt, now = Date.now()) {
   return age < 0 || age <= QUOTE_STALE_AFTER_SECONDS * 1000;
 }
 
+function valuationIsCurrent(quote, now = new Date()) {
+  const valuationDate = pickText(quote.true_valuation_date, quote.trueValuationDate);
+  if (!valuationDate) return true;
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(now);
+  const today = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return valuationDate.slice(0, 10) === `${today.year}-${today.month}-${today.day}`;
+}
+
 function colorFor(value, colors) {
   if (value === null || value === undefined || !Number.isFinite(Number(value))) return colors.secondary;
   return Number(value) > 0 ? colors.positive : Number(value) < 0 ? colors.negative : colors.neutral;
@@ -325,14 +336,19 @@ function normalizeRows(holdings, fundInfo, quoteById = new Map()) {
         : dailyChangePct !== null && shares !== null && estimateNav !== null && lastNav !== null
           ? shares * (estimateNav - lastNav)
           : null;
-    const quoteAt = parseTimestamp(pickText(
-      quote.gztime, quote.vgsztime, quote.zsgztime, quote.quote_time, quote.update_time,
-      quote.updated_at, quote.timestamp, quote.server_time, quote.serverTime,
-      info.gztime, info.update_time, info.updated_at, info.timestamp, info.server_time,
+    const quoteTime = pickText(
+      quote.time, quote.estimate_time, quote.quote_time, quote.update_time, quote.updated_at,
+      quote.timestamp, quote.server_time, quote.serverTime, quote.last_update,
+      quote.vgsztime, quote.zsgztime, quote.gztime,
+    );
+    const quoteAt = parseTimestamp(quoteTime || pickText(
+      info.update_time, info.updated_at, info.timestamp, info.server_time, info.gztime,
     ));
-    const sourceIsLive = (quoteSource === 'realtime' || quoteSource === 'estimate')
+    const sourceIsLive = (quoteSource === 'realtime' || quoteSource === 'estimate'
+      || (quoteSource === 'overview' && !!quoteTime))
       && (liveDailyPct !== null || quoteDailyChangeAmount !== null);
     const fresh = quoteIsFresh(quoteAt);
+    const currentValuation = valuationIsCurrent(quote);
     return {
       name: String(info.short_name || info.name || info.fund_name || info.fundName
         || holding.short_name || holding.name || holding.fund_name || holding.fundName || id || '基金'),
@@ -343,8 +359,8 @@ function normalizeRows(holdings, fundInfo, quoteById = new Map()) {
       latestNavFetched: [quoteNav, infoNav, holdingLatestNav].some((value) => value !== null && value > 0),
       dailyChangeAmount,
       dailyChangePct,
-      dailyChangeIsLive: sourceIsLive && fresh,
-      dailyChangeSource: sourceIsLive && !fresh ? 'stale' : quoteSource,
+      dailyChangeIsLive: sourceIsLive && fresh && currentValuation,
+      dailyChangeSource: sourceIsLive && (!fresh || !currentValuation) ? 'stale' : quoteSource,
       marketStatus: normalizeMarketStatus(
         quote.market_status, quote.marketStatus, quote.status, quote.is_open,
         info.market_status, info.marketStatus, info.status, info.is_open,
@@ -417,7 +433,7 @@ function mergeCachedRows(rows, cachedRows) {
   const cachedById = new Map(normalizedCache.filter((row) => row.id).map((row) => [String(row.id), row]));
   const cachedByName = new Map(normalizedCache.map((row) => [String(row.name), row]));
   return rows.map((row) => {
-    if (row.dailyChangeIsLive) return row;
+    if (row.dailyChangeIsLive || row.quoteAvailable) return row;
     const cached = cachedById.get(String(row.id)) || cachedByName.get(String(row.name));
     if (!cached) return row;
     const cachedDailyChangeAmount = cached.dailyChangeAmount ?? cached.estimateAmount;
@@ -473,6 +489,7 @@ function resolveDataStatus(rows, marketStatus, requestState) {
   if (requestState === 'loading') return 'loading';
   if (marketStatus !== '开市') return 'closed';
   if (requestState === 'error') return 'error';
+  if (requestState === 'quote-error') return 'quote-error';
   if (!rows.length) return 'empty';
   const liveCount = liveRowCount(rows);
   if (liveCount === rows.length) return 'live';
@@ -483,6 +500,7 @@ function resolveDataStatus(rows, marketStatus, requestState) {
 function statusLabelFor(marketStatus, dataStatus) {
   if (dataStatus === 'loading') return '加载中';
   if (dataStatus === 'error') return marketStatus === '开市' ? '开市 · 更新失败' : '休市 · 更新失败';
+  if (dataStatus === 'quote-error') return '开市 · 行情源请求失败';
   if (dataStatus === 'live') return '开市 · 实时';
   if (dataStatus === 'partial') return '开市 · 部分实时';
   if (dataStatus === 'delayed') return '开市 · 数据延迟';
@@ -616,7 +634,7 @@ function makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family
     ? '#43C89A'
     : resolvedDataStatus === 'partial'
       ? '#FFB84D'
-      : resolvedDataStatus === 'error'
+      : resolvedDataStatus === 'error' || resolvedDataStatus === 'quote-error'
         ? '#FF6B5F'
         : '#A9AAB5';
   const denseLayout = !lockScreen && (
@@ -814,9 +832,17 @@ async function request(ctx, { base, path, token, secret, api, method = 'GET', bo
 }
 
 async function requestQuote(ctx, options) {
+  const diagnostics = options.quoteDiagnostics;
+  if (diagnostics) diagnostics.attempted += 1;
   try {
-    return readObject(await request(ctx, options));
+    const quote = readObject(await request(ctx, options));
+    if (diagnostics) {
+      if (hasUsableQuote(quote)) diagnostics.usable += 1;
+      else diagnostics.empty += 1;
+    }
+    return quote;
   } catch (_) {
+    if (diagnostics) diagnostics.failed += 1;
     return {};
   }
 }
@@ -876,7 +902,8 @@ function historyNav(item) {
   );
 }
 
-async function fetchHistoryQuote(ctx, { base, token, secret, policy, fundId, tokenState }) {
+async function fetchHistoryQuote(ctx, { base, token, secret, policy, fundId, tokenState, quoteDiagnostics }) {
+  if (quoteDiagnostics) quoteDiagnostics.attempted += 1;
   try {
     const data = await request(ctx, {
       base,
@@ -900,6 +927,10 @@ async function fetchHistoryQuote(ctx, { base, token, secret, policy, fundId, tok
       : currentNav !== null && previousNav !== null && previousNav !== 0
         ? { ...current, day_growth_rate: (currentNav - previousNav) / previousNav * 100 }
         : current;
+    if (quoteDiagnostics) {
+      if (hasUsableQuote(dailyRate)) quoteDiagnostics.usable += 1;
+      else quoteDiagnostics.empty += 1;
+    }
     return {
       ...dailyRate,
       nav: currentNav,
@@ -910,6 +941,7 @@ async function fetchHistoryQuote(ctx, { base, token, secret, policy, fundId, tok
       ),
     };
   } catch (_) {
+    if (quoteDiagnostics) quoteDiagnostics.failed += 1;
     return {};
   }
 }
@@ -968,7 +1000,7 @@ async function requestQuoteSource(health, sourceKey, runner) {
   return {};
 }
 
-async function fetchNewQuotes(ctx, { base, token, secret, policy, fundIds, tokenState }) {
+async function fetchNewQuotes(ctx, { base, token, secret, policy, fundIds, tokenState, quoteDiagnostics }) {
   const uniqueFundIds = [...new Set(fundIds.map((id) => String(id)))];
   const sourceHealth = createQuoteSourceHealth();
   const pairs = await mapWithConcurrency(uniqueFundIds, QUOTE_CONCURRENCY, async (fundId) => {
@@ -977,27 +1009,27 @@ async function fetchNewQuotes(ctx, { base, token, secret, policy, fundIds, token
     const rate = await requestQuoteSource(sourceHealth, 'increase-rate', () => requestQuoteWithRetry(ctx, {
       base,
       path: `/market/v1/fund/increase-rate?fund_id=${encodeURIComponent(fundId)}`,
-      token, secret, api: 'new', policy, tokenState,
+      token, secret, api: 'new', policy, tokenState, quoteDiagnostics,
     }, QUOTE_ATTEMPTS, true));
     if (hasUsableQuote(rate)) return [fundId, { ...rate, _quoteSource: 'realtime' }];
 
     const estimate = await requestQuoteSource(sourceHealth, 'gz-data', () => requestQuoteWithRetry(ctx, {
       base,
       path: `/market/v1/fund/gz-data?fund_id=${encodeURIComponent(fundId)}&source=1`,
-      token, secret, api: 'new', policy, tokenState,
+      token, secret, api: 'new', policy, tokenState, quoteDiagnostics,
     }, 1));
     let merged = { ...estimate, ...rate };
     if (!hasUsableQuote(merged)) {
       const overview = await requestQuoteSource(sourceHealth, 'overview', () => requestQuote(ctx, {
         base,
         path: `/market/v1/fund/overview?data_source=1&fund_id=${encodeURIComponent(fundId)}`,
-        token, secret, api: 'new', policy, tokenState,
+        token, secret, api: 'new', policy, tokenState, quoteDiagnostics,
       }));
       merged = { ...overview, ...merged, _quoteSource: 'overview' };
     }
     if (!hasUsableQuote(merged)) {
       const history = await requestQuoteSource(sourceHealth, 'history', () => fetchHistoryQuote(ctx, {
-        base, token, secret, policy, fundId, tokenState,
+        base, token, secret, policy, fundId, tokenState, quoteDiagnostics,
       }));
       merged = { ...history, ...merged, _quoteSource: 'history' };
     }
@@ -1059,11 +1091,12 @@ async function fetchNew(ctx, env, tokenState) {
     }
   }
   const explicitStatus = explicitStatusFromRecords([...holdings, ...fundInfo]);
+  const quoteDiagnostics = { attempted: 0, usable: 0, empty: 0, failed: 0 };
   const quoteById = fundIds.length && explicitStatus !== '休市'
-    ? await fetchNewQuotes(ctx, { base, token, secret, policy, fundIds, tokenState })
+    ? await fetchNewQuotes(ctx, { base, token, secret, policy, fundIds, tokenState, quoteDiagnostics })
     : new Map();
   const rows = normalizeRows(holdings, fundInfo, quoteById);
-  return { rows, marketStatus: resolveMarketStatus(rows) };
+  return { rows, marketStatus: resolveMarketStatus(rows), quoteDiagnostics };
 }
 
 async function fetchOld(ctx, env, tokenState) {
@@ -1177,7 +1210,13 @@ export default async function (ctx) {
     const lastSuccessAt = Date.now();
     updatedAt = localTime(new Date(lastSuccessAt));
     state = '实时';
-    dataStatus = resolveDataStatus(rows, marketStatus, 'success');
+    const quoteDiagnostics = fetched.quoteDiagnostics;
+    const quoteRequestState = quoteDiagnostics
+      && quoteDiagnostics.usable === 0
+      && quoteDiagnostics.failed > 0
+      ? 'quote-error'
+      : 'success';
+    dataStatus = resolveDataStatus(rows, marketStatus, quoteRequestState);
     refreshSeconds = marketStatus === '开市' ? OPEN_REFRESH_SECONDS : CLOSED_REFRESH_SECONDS;
     await writeCache(ctx, { rows, marketStatus, updatedAt, lastSuccessAt, savedAt: lastSuccessAt });
   } catch (error) {
