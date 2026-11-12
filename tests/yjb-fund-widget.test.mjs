@@ -15,6 +15,17 @@ function textNodes(node, out = []) {
   return out;
 }
 
+function denseFundRows(widgetNode) {
+  return (widgetNode.children || [])
+    .filter((child) => child.type === 'stack'
+      && child.direction === 'row'
+      && child.children?.[0]?.children?.[0]?.text === '●')
+    .map((child) => ({
+      name: child.children[0].children[1].text,
+      dotColor: child.children[0].children[0].textColor,
+    }));
+}
+
 function storage(seed, failWrites = false) {
   const values = new Map(Object.entries(seed || {}));
   return {
@@ -103,6 +114,62 @@ async function testClosedStateAndFallbackParsing() {
   assert.equal(quoteCalls, 0, 'closed market should not request quote fallbacks');
   assert.equal(dots.length, 3);
   assert.deepEqual(dots.map((node) => node.textColor), ['#FF5B5B', '#FF5B5B', '#A9AAB5']);
+}
+
+async function testOpenMarketGroupsRowsByDotColor() {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(new Date()).map((part) => [part.type, part.value]));
+  const today = `${parts.year}-${parts.month}-${parts.day}`;
+  const now = new Date().toISOString();
+  const holdings = [
+    { fund_id: 221, short_name: '延迟一', market_status: 'open' },
+    { fund_id: 222, short_name: '实时一', market_status: 'open' },
+    { fund_id: 223, short_name: '无数据', market_status: 'open' },
+    { fund_id: 224, short_name: '延迟二', market_status: 'open' },
+    { fund_id: 225, short_name: '实时二', market_status: 'open' },
+  ];
+  const liveIds = new Set([222, 225]);
+  const ctx = {
+    env: { YJB_TOKEN: 'test', YJB_SIGNING_SECRET: 'test' },
+    widgetFamily: 'systemLarge',
+    storage: storage(),
+    http: {
+      get: async (url) => {
+        if (url.includes('/users/v1/user-account')) return response({ list: [{ id: 1 }] });
+        if (url.includes('/fund-accounts/')) return response({ list: holdings });
+        if (url.includes('/increase-rate')) {
+          const id = Number(new URL(url).searchParams.get('fund_id'));
+          if (id === 223) return response({ market_status: 'open' });
+          const amounts = { 221: 4, 222: 2, 224: -2, 225: 5 };
+          const percents = { 221: 0.4, 222: 0.2, 224: -0.2, 225: 0.5 };
+          return response({
+            weighted_increase_rate: percents[id],
+            increase_amount: amounts[id],
+            market_status: 'open',
+            time: now,
+            true_valuation_date: liveIds.has(id) ? today : '2000-01-01',
+          });
+        }
+        if (url.includes('/gz-data')) return response({ day: today, list: null });
+        if (url.includes('/fund/overview')) return response({});
+        if (url.includes('/fund-history-nav')) return response({ list: [] });
+        throw new Error(url);
+      },
+      post: async () => response([]),
+    },
+  };
+
+  const rows = denseFundRows(await widget(ctx));
+  assert.deepEqual(rows.map((row) => row.name), ['实时二', '实时一', '延迟一', '延迟二', '无数据']);
+  assert.deepEqual(rows.map((row) => row.dotColor), [
+    '#43C89A', '#43C89A', '#FF5B5B', '#FF5B5B', '#A9AAB5',
+  ]);
+
+  const inlineValues = textNodes(await widget({ ...ctx, widgetFamily: 'accessoryInline', storage: storage() }))
+    .map((node) => String(node.text));
+  assert(inlineValues.some((value) => value.includes('实时二')));
+  assert(!inlineValues.some((value) => value.includes('实时一')));
 }
 
 async function testClosedLatestNavUsesGreenIndicator() {
@@ -321,6 +388,7 @@ async function testSlowQuoteCompletesBeforeFetchDeadline() {
 
 await testFamilies();
 await testClosedStateAndFallbackParsing();
+await testOpenMarketGroupsRowsByDotColor();
 await testClosedLatestNavUsesGreenIndicator();
 await testStorageFailureDoesNotHideData();
 await testSourceCircuitBreakerAndBatchFallback();
@@ -329,4 +397,4 @@ await testTokenConfigurationStates();
 await testQuoteSourceFailureIsVisibleWithCachedValues();
 await testOverviewNestedQuoteFallback();
 await testSlowQuoteCompletesBeforeFetchDeadline();
-console.log('PASS: widget families, token and quote-source states, slow-fetch recovery, closed-state semantics, and storage isolation');
+console.log('PASS: widget families, open-market dot grouping, token and quote-source states, slow-fetch recovery, closed-state semantics, and storage isolation');

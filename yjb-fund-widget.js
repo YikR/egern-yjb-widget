@@ -530,6 +530,38 @@ function statusDotColor(row, liveWindow = true, marketStatus = '开市') {
   return hasValue ? '#FF5B5B' : '#A9AAB5';
 }
 
+function rowsByOpenMarketDotColor(rows, marketStatus, liveWindow) {
+  if (marketStatus !== '开市') return rows;
+  return rows
+    .map((row, index) => {
+      const dotColor = statusDotColor(row, liveWindow, marketStatus);
+      const amount = Number(row.dailyChangeAmount);
+      const percent = Number(row.dailyChangePct);
+      return {
+        row,
+        index,
+        rank: dotColor === '#43C89A' ? 0 : dotColor === '#FF5B5B' ? 1 : 2,
+        amount: Number.isFinite(amount) ? amount : null,
+        percent: Number.isFinite(percent) ? percent : null,
+      };
+    })
+    .sort((left, right) => {
+      if (left.rank !== right.rank) return left.rank - right.rank;
+      if (left.amount === null && right.amount !== null) return 1;
+      if (left.amount !== null && right.amount === null) return -1;
+      if (left.amount !== null && right.amount !== null && left.amount !== right.amount) {
+        return right.amount - left.amount;
+      }
+      if (left.percent === null && right.percent !== null) return 1;
+      if (left.percent !== null && right.percent === null) return -1;
+      if (left.percent !== null && right.percent !== null && left.percent !== right.percent) {
+        return right.percent - left.percent;
+      }
+      return left.index - right.index;
+    })
+    .map(({ row }) => row);
+}
+
 function fundNameNode(row, size, weight, colors, maxLines = 1, minScale = 0.7, liveWindow = true, marketStatus = '开市') {
   const name = text(row.name, size, weight, colors.primary, maxLines, minScale);
   name.flex = 1;
@@ -629,6 +661,7 @@ function makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family
   const lockScreen = family.startsWith('accessory');
   const resolvedDataStatus = dataStatus || resolveDataStatus(rows, marketStatus, state === '加载中' ? 'loading' : state === '实时' ? 'success' : 'error');
   const liveWindow = marketStatus === '开市' && (resolvedDataStatus === 'live' || resolvedDataStatus === 'partial');
+  const displayRows = rowsByOpenMarketDotColor(rows, marketStatus, liveWindow);
   const statusLabel = statusLabelFor(marketStatus, resolvedDataStatus);
   const statusColor = resolvedDataStatus === 'live'
     ? '#43C89A'
@@ -650,7 +683,7 @@ function makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family
     neutral: '#E4E5EB',
   };
   if (family === 'accessoryInline') {
-    const row = rows[0];
+    const row = displayRows[0];
     const value = row ? holdingRow(row, family, colors, options, liveWindow, marketStatus).text : state;
     return {
       type: 'widget',
@@ -683,15 +716,15 @@ function makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family
     children.push(text(emptyMessage, 'subheadline', 'medium', colors.secondary, 2));
   } else {
     const visible = denseLayout
-      ? rows
-      : rows.slice(0, family === 'systemSmall' ? 1 : compact ? 1 : 2);
+      ? displayRows
+      : displayRows.slice(0, family === 'systemSmall' ? 1 : compact ? 1 : 2);
     for (const row of visible) {
       children.push(denseLayout
         ? denseHoldingRow(row, colors, options, liveWindow, marketStatus)
         : holdingRow(row, family, colors, options, liveWindow, marketStatus));
     }
-    if (!denseLayout && rows.length > visible.length) {
-      children.push(text(`另有 ${rows.length - visible.length} 只`, 'caption2', 'regular', colors.secondary));
+    if (!denseLayout && displayRows.length > visible.length) {
+      children.push(text(`另有 ${displayRows.length - visible.length} 只`, 'caption2', 'regular', colors.secondary));
     }
   }
 
