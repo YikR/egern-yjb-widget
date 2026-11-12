@@ -530,8 +530,7 @@ function statusDotColor(row, liveWindow = true, marketStatus = '开市') {
   return hasValue ? '#FF5B5B' : '#A9AAB5';
 }
 
-function rowsByOpenMarketDotColor(rows, marketStatus, liveWindow) {
-  if (marketStatus !== '开市') return rows;
+function rowsByDotColorAndIncome(rows, marketStatus, liveWindow) {
   return rows
     .map((row, index) => {
       const dotColor = statusDotColor(row, liveWindow, marketStatus);
@@ -661,7 +660,7 @@ function makeWidget(rows, updatedAt, state, marketStatus, refreshSeconds, family
   const lockScreen = family.startsWith('accessory');
   const resolvedDataStatus = dataStatus || resolveDataStatus(rows, marketStatus, state === '加载中' ? 'loading' : state === '实时' ? 'success' : 'error');
   const liveWindow = marketStatus === '开市' && (resolvedDataStatus === 'live' || resolvedDataStatus === 'partial');
-  const displayRows = rowsByOpenMarketDotColor(rows, marketStatus, liveWindow);
+  const displayRows = rowsByDotColorAndIncome(rows, marketStatus, liveWindow);
   const statusLabel = statusLabelFor(marketStatus, resolvedDataStatus);
   const statusColor = resolvedDataStatus === 'live'
     ? '#43C89A'

@@ -201,6 +201,34 @@ async function testClosedLatestNavUsesGreenIndicator() {
   assert.deepEqual(dots.map((node) => node.textColor), ['#43C89A', '#43C89A']);
 }
 
+async function testClosedMarketSortsByIncome() {
+  const holdings = [
+    { fund_id: 231, short_name: '休市负收益', money: 1000, market_status: 'closed' },
+    { fund_id: 232, short_name: '休市高收益', money: 1000, market_status: 'closed' },
+    { fund_id: 233, short_name: '休市中收益', money: 1000, market_status: 'closed' },
+  ];
+  const ctx = {
+    env: { YJB_TOKEN: 'test', YJB_SIGNING_SECRET: 'test' },
+    widgetFamily: 'systemLarge',
+    storage: storage(),
+    http: {
+      get: async (url) => {
+        if (url.includes('/users/v1/user-account')) return response({ list: [{ id: 1 }] });
+        if (url.includes('/fund-accounts/')) return response({ list: holdings });
+        if (url.includes('/fund/')) throw new Error(`closed market should not request quote source: ${url}`);
+        throw new Error(url);
+      },
+      post: async () => response({ result: {
+        one: { fund_id: 231, short_name: '休市负收益', nav: 1.1, day_growth_rate: -10, market_status: 'closed' },
+        two: { fund_id: 232, short_name: '休市高收益', nav: 1.2, day_growth_rate: 20, market_status: 'closed' },
+        three: { fund_id: 233, short_name: '休市中收益', nav: 1.15, day_growth_rate: 5, market_status: 'closed' },
+      } }),
+    },
+  };
+  const rows = denseFundRows(await widget(ctx));
+  assert.deepEqual(rows.map((row) => row.name), ['休市高收益', '休市中收益', '休市负收益']);
+}
+
 async function testStorageFailureDoesNotHideData() {
   const ctx = liveContext('systemMedium');
   ctx.storage = storage({}, true);
@@ -390,6 +418,7 @@ await testFamilies();
 await testClosedStateAndFallbackParsing();
 await testOpenMarketGroupsRowsByDotColor();
 await testClosedLatestNavUsesGreenIndicator();
+await testClosedMarketSortsByIncome();
 await testStorageFailureDoesNotHideData();
 await testSourceCircuitBreakerAndBatchFallback();
 await testAmountOnlyPrimarySource();
